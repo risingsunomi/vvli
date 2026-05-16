@@ -39,6 +39,10 @@ pub const OptionalFiles = [_][]const u8{
     "added_tokens.json",
 };
 
+const DownloadOptions = struct {
+    progress: bool = true,
+};
+
 pub fn validateRepoId(repo_id: []const u8) Error!void {
     if (repo_id.len == 0) return Error.InvalidRepoId;
     var slash_count: usize = 0;
@@ -113,7 +117,7 @@ pub fn ensureSnapshotForFiles(
         try downloadFile(allocator, io, repo, file_path, directory);
     }
     for (optional_files) |file_path| {
-        downloadFile(allocator, io, repo, file_path, directory) catch {};
+        downloadFileWithOptions(allocator, io, repo, file_path, directory, .{ .progress = false }) catch {};
     }
 
     return .{ .allocator = allocator, .repo = repo, .directory = directory };
@@ -126,6 +130,17 @@ pub fn downloadFile(
     file_path: []const u8,
     directory: []const u8,
 ) !void {
+    return downloadFileWithOptions(allocator, io, repo, file_path, directory, .{});
+}
+
+fn downloadFileWithOptions(
+    allocator: Allocator,
+    io: std.Io,
+    repo: ModelRef,
+    file_path: []const u8,
+    directory: []const u8,
+    options: DownloadOptions,
+) !void {
     const url = try resolveUrl(allocator, repo, file_path);
     defer allocator.free(url);
 
@@ -133,17 +148,44 @@ pub fn downloadFile(
     defer allocator.free(out_path);
     if (try existingFileHasBytes(io, out_path)) return;
 
+    if (options.progress) {
+        var stderr_buffer: [512]u8 = undefined;
+        var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+        try stderr_writer.interface.print("download: {s}/{s}\n", .{ repo.repo_id, file_path });
+        try stderr_writer.interface.flush();
+    }
+
     const argv = [_][]const u8{
         "curl",
         "-L",
         "--fail",
+        "--show-error",
         "--retry",
         "3",
+        if (options.progress) "--progress-bar" else "--silent",
         "--create-dirs",
         "-o",
         out_path,
         url,
     };
+
+    if (options.progress) {
+        var child = std.process.spawn(io, .{
+            .argv = &argv,
+            .stdin = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return Error.MissingCurl,
+            else => return err,
+        };
+        const term = try child.wait(io);
+        switch (term) {
+            .exited => |code| if (code != 0) return Error.DownloadFailed,
+            else => return Error.DownloadFailed,
+        }
+        return;
+    }
 
     const result = std.process.run(allocator, io, .{
         .argv = &argv,
@@ -277,8 +319,27 @@ pub fn chooseDefaultNativeGguf(files: []const []const u8) ?[]const u8 {
 
     for (preferred_suffixes) |suffix| {
         for (files) |file| {
+            if (isMmprojGguf(file)) continue;
             if (std.mem.endsWith(u8, file, suffix)) return file;
         }
+    }
+    return null;
+}
+
+pub fn chooseDefaultMmprojGguf(files: []const []const u8) ?[]const u8 {
+    const preferred_names = [_][]const u8{
+        "mmproj-F16.gguf",
+        "mmproj-BF16.gguf",
+        "mmproj-F32.gguf",
+    };
+
+    for (preferred_names) |name| {
+        for (files) |file| {
+            if (std.mem.eql(u8, file, name)) return file;
+        }
+    }
+    for (files) |file| {
+        if (isMmprojGguf(file)) return file;
     }
     return null;
 }
@@ -288,6 +349,10 @@ pub fn hasGguf(files: []const []const u8) bool {
         if (std.mem.endsWith(u8, file, ".gguf")) return true;
     }
     return false;
+}
+
+fn isMmprojGguf(file: []const u8) bool {
+    return std.mem.indexOf(u8, file, "mmproj") != null and std.mem.endsWith(u8, file, ".gguf");
 }
 
 fn existingFileHasBytes(io: std.Io, path: []const u8) !bool {
@@ -332,4 +397,16 @@ test "chooses native gguf before quantized files" {
     try std.testing.expectEqualStrings("Model-BF16.gguf", chooseDefaultNativeGguf(&files).?);
     try std.testing.expect(hasGguf(&files));
     try std.testing.expect(containsFile(&files, "Model-Q4_K_M.gguf"));
+}
+
+test "chooses native text gguf and mmproj files separately" {
+    const files = [_][]const u8{
+        "mmproj-BF16.gguf",
+        "Model-Q4_K_M.gguf",
+        "Model-BF16.gguf",
+        "mmproj-F16.gguf",
+    };
+
+    try std.testing.expectEqualStrings("Model-BF16.gguf", chooseDefaultNativeGguf(&files).?);
+    try std.testing.expectEqualStrings("mmproj-F16.gguf", chooseDefaultMmprojGguf(&files).?);
 }

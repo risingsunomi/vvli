@@ -48,6 +48,22 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "llm", .module = llm_mod }},
     });
 
+    const vision_mod = b.addModule("vision", .{
+        .root_source_file = b.path("src/vision.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const vlm_mod = b.addModule("vlm", .{
+        .root_source_file = b.path("src/vlm.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "gguf", .module = gguf_mod },
+            .{ .name = "vision", .module = vision_mod },
+        },
+    });
+
     const exe = b.addExecutable(.{
         .name = "vvli",
         .root_module = b.createModule(.{
@@ -61,6 +77,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "tokenizer", .module = tokenizer_mod },
                 .{ .name = "gguf", .module = gguf_mod },
                 .{ .name = "generator", .module = generator_mod },
+                .{ .name = "vision", .module = vision_mod },
+                .{ .name = "vlm", .module = vlm_mod },
             },
         }),
     });
@@ -112,6 +130,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_generator_tests = b.addRunArtifact(generator_tests);
 
+    const vision_tests = b.addTest(.{
+        .name = "vision-test",
+        .root_module = vision_mod,
+    });
+    const run_vision_tests = b.addRunArtifact(vision_tests);
+
+    const vlm_tests = b.addTest(.{
+        .name = "vlm-test",
+        .root_module = vlm_mod,
+    });
+    const run_vlm_tests = b.addRunArtifact(vlm_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_tensor_tests.step);
@@ -120,4 +150,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tokenizer_tests.step);
     test_step.dependOn(&run_gguf_tests.step);
     test_step.dependOn(&run_generator_tests.step);
+    test_step.dependOn(&run_vision_tests.step);
+    test_step.dependOn(&run_vlm_tests.step);
 }

@@ -70,8 +70,21 @@ zig build -Doptimize=ReleaseFast run -- \
 Output ends with decode throughput:
 
 ```text
-[42 output tokens | 18.73 tok/sec | 2.24s decode]
+[# output tokens | # tok/sec | #s decode]
 ```
+
+Required downloads stream curl progress in the terminal. Weight loading also reports percent progress while tensors are copied into VVLI's contiguous CPU-owned storage.
+
+Vision-language GGUF repos can be addressed by repo id and a local image path. The current `--image` path is native Zig-owned plumbing: VVLI validates the image, downloads/selects the text GGUF plus `mmproj`, parses both GGUF files, and reports the VLM plan before stopping at the remaining native execution kernels.
+
+```sh
+zig build -Doptimize=ReleaseFast run -- \
+  --repo unsloth/Qwen3.5-9B-GGUF \
+  --image ./image.jpg \
+  --prompt "Describe this image in one sentence."
+```
+
+VVLI auto-selects a native BF16/F16/F32 text GGUF and `mmproj-F16.gguf` when present. Use `--weights <file>` or `--mmproj <file>` to override selection.
 
 ## CLI Options
 
@@ -80,7 +93,9 @@ Output ends with decode throughput:
 - `--cache <dir>`: local model cache, default `.vvli-cache`
 - `--format <type>`: `auto`, `safetensors`, or `gguf`
 - `--weights <file>`: weight file in the repo; GGUF auto-selects BF16/F16/F32 when possible
+- `--mmproj <file>`: multimodal projector file for `--image` GGUF runs
 - `--prompt <text>`: prompt text
+- `--image <path>`: local image path for the native vision-language path
 - `--max-new-tokens <n>`: output token limit, default `64`
 - `--ctx <n>`: KV cache length, default `512`
 - `--threads <n>`: CPU worker count, where `0` uses host CPU count
@@ -91,6 +106,7 @@ Output ends with decode throughput:
 
 - Dense safetensors: Qwen2 and Llama-style decoder layouts are the current runtime path.
 - GGUF: BF16/F16/F32 dense GGUF parsing and loading is the native-float boundary. Quantized GGUF files such as Q4/Q8 are rejected with `QuantizedGgufUnsupported`/`UnsupportedDType` until dequant kernels exist.
+- Vision-language GGUF: repos such as `unsloth/Qwen3.5-9B-GGUF` expose image-text model metadata and separate projector files. VVLI validates `--image`, downloads/selects the text GGUF plus `mmproj`, and parses the native VLM plan. Image decode/resize, patch embedding, projector forward pass, multimodal token insertion, and Qwen3.5 text execution are still planned inside VVLI.
 - MoE: OLMoE-style configs are detected via MoE fields (`num_experts`, `num_experts_per_tok`) and rejected with `MoeRuntimeUnsupported` until router/top-k expert execution is implemented.
 - Sharded safetensors: repos with `model.safetensors.index.json` are rejected with `ShardedSafetensorsUnsupported` until index parsing and multi-file loading are implemented.
 
@@ -109,6 +125,8 @@ zig build -Doptimize=ReleaseFast test
 - `src/gguf.zig`: GGUF metadata and tensor table parser
 - `src/generator.zig`: greedy generation and throughput stats
 - `src/hf_downloader.zig`: Hugging Face snapshot downloader
+- `src/vision.zig`: local image path validation and future vision-language input boundary
+- `src/vlm.zig`: native VLM GGUF/mmproj plan loading
 - `src/main.zig`: CLI prompt runner
 
 ## License

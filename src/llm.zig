@@ -58,6 +58,15 @@ pub const RuntimeOptions = struct {
     preload_layers_ahead: usize = 1,
 };
 
+pub const LoadProgress = struct {
+    context: ?*anyopaque = null,
+    on_step: ?*const fn (?*anyopaque, completed: usize, total: usize, name: []const u8) void = null,
+
+    pub fn report(self: LoadProgress, completed: usize, total: usize, name: []const u8) void {
+        if (self.on_step) |callback| callback(self.context, completed, total, name);
+    }
+};
+
 pub const Config = struct {
     architecture: Architecture = .qwen2,
     feed_forward: FeedForwardKind = .dense,
@@ -816,6 +825,17 @@ pub fn loadOwnedFromSafetensorsFile(
     kind: WeightKind,
     path: []const u8,
 ) !OwnedModel {
+    return loadOwnedFromSafetensorsFileWithProgress(allocator, io, config, kind, path, .{});
+}
+
+pub fn loadOwnedFromSafetensorsFileWithProgress(
+    allocator: Allocator,
+    io: std.Io,
+    config: Config,
+    kind: WeightKind,
+    path: []const u8,
+    progress: LoadProgress,
+) !OwnedModel {
     var owned = try OwnedModel.init(allocator, config, kind);
     errdefer owned.deinit();
 
@@ -830,7 +850,7 @@ pub fn loadOwnedFromSafetensorsFile(
     });
     defer map.destroy(io);
 
-    try loadSafetensorsIntoOwnedModel(&owned, map.memory);
+    try loadSafetensorsIntoOwnedModel(&owned, map.memory, progress);
     return owned;
 }
 
@@ -839,6 +859,16 @@ pub fn loadOwnedFromGgufFile(
     io: std.Io,
     kind: WeightKind,
     path: []const u8,
+) !OwnedModel {
+    return loadOwnedFromGgufFileWithProgress(allocator, io, kind, path, .{});
+}
+
+pub fn loadOwnedFromGgufFileWithProgress(
+    allocator: Allocator,
+    io: std.Io,
+    kind: WeightKind,
+    path: []const u8,
+    progress: LoadProgress,
 ) !OwnedModel {
     var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
     defer file.close(io);
@@ -858,11 +888,11 @@ pub fn loadOwnedFromGgufFile(
     var owned = try OwnedModel.init(allocator, config, kind);
     errdefer owned.deinit();
 
-    try loadGgufIntoOwnedModel(&owned, parsed, map.memory);
+    try loadGgufIntoOwnedModel(&owned, parsed, map.memory, progress);
     return owned;
 }
 
-fn loadSafetensorsIntoOwnedModel(owned: *OwnedModel, bytes: []const u8) !void {
+fn loadSafetensorsIntoOwnedModel(owned: *OwnedModel, bytes: []const u8, progress: LoadProgress) !void {
     if (bytes.len < 8) return Error.InvalidWeight;
     const header_len: usize = @intCast(std.mem.readInt(u64, bytes[0..8], .little));
     if (8 + header_len > bytes.len) return Error.InvalidWeight;
@@ -875,60 +905,149 @@ fn loadSafetensorsIntoOwnedModel(owned: *OwnedModel, bytes: []const u8) !void {
     const tensors = parsed.value.object;
 
     const config = owned.config;
+    const total_steps = weightLoadStepCount(owned);
+    var completed_steps: usize = 0;
+    progress.report(completed_steps, total_steps, "start");
+
     try copyTensorIntoWeight(owned.weights.token_embedding.values, tensors, data, "model.embed_tokens.weight");
+    advanceLoadProgress(progress, &completed_steps, total_steps, "model.embed_tokens.weight");
 
     var name_buf: [160]u8 = undefined;
     for (owned.layers, 0..) |layer, i| {
-        try copyTensorIntoWeight(layer.input_norm, tensors, data, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.input_layernorm.weight", .{i}));
-        try copyTensorIntoWeight(layer.q_proj.values, tensors, data, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{i}));
+        var name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.input_layernorm.weight", .{i});
+        try copyTensorIntoWeight(layer.input_norm, tensors, data, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{i});
+        try copyTensorIntoWeight(layer.q_proj.values, tensors, data, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
         if (config.qkv_bias) {
-            try copyTensorIntoWeight(layer.q_bias.?, tensors, data, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.bias", .{i}));
+            name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.bias", .{i});
+            try copyTensorIntoWeight(layer.q_bias.?, tensors, data, name);
+            advanceLoadProgress(progress, &completed_steps, total_steps, name);
         }
-        try copyTensorIntoWeight(layer.k_proj.values, tensors, data, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{i}));
+
+        name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{i});
+        try copyTensorIntoWeight(layer.k_proj.values, tensors, data, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
         if (config.qkv_bias) {
-            try copyTensorIntoWeight(layer.k_bias.?, tensors, data, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.bias", .{i}));
+            name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.bias", .{i});
+            try copyTensorIntoWeight(layer.k_bias.?, tensors, data, name);
+            advanceLoadProgress(progress, &completed_steps, total_steps, name);
         }
-        try copyTensorIntoWeight(layer.v_proj.values, tensors, data, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{i}));
+
+        name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{i});
+        try copyTensorIntoWeight(layer.v_proj.values, tensors, data, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
         if (config.qkv_bias) {
-            try copyTensorIntoWeight(layer.v_bias.?, tensors, data, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.bias", .{i}));
+            name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.bias", .{i});
+            try copyTensorIntoWeight(layer.v_bias.?, tensors, data, name);
+            advanceLoadProgress(progress, &completed_steps, total_steps, name);
         }
-        try copyTensorIntoWeight(layer.o_proj.values, tensors, data, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.o_proj.weight", .{i}));
-        try copyTensorIntoWeight(layer.post_attention_norm, tensors, data, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.post_attention_layernorm.weight", .{i}));
-        try copyTensorIntoWeight(layer.gate_proj.values, tensors, data, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.gate_proj.weight", .{i}));
-        try copyTensorIntoWeight(layer.up_proj.values, tensors, data, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.up_proj.weight", .{i}));
-        try copyTensorIntoWeight(layer.down_proj.values, tensors, data, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.down_proj.weight", .{i}));
+
+        name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.o_proj.weight", .{i});
+        try copyTensorIntoWeight(layer.o_proj.values, tensors, data, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.post_attention_layernorm.weight", .{i});
+        try copyTensorIntoWeight(layer.post_attention_norm, tensors, data, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.gate_proj.weight", .{i});
+        try copyTensorIntoWeight(layer.gate_proj.values, tensors, data, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.up_proj.weight", .{i});
+        try copyTensorIntoWeight(layer.up_proj.values, tensors, data, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.down_proj.weight", .{i});
+        try copyTensorIntoWeight(layer.down_proj.values, tensors, data, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
     }
 
     try copyTensorIntoWeight(owned.weights.final_norm, tensors, data, "model.norm.weight");
+    advanceLoadProgress(progress, &completed_steps, total_steps, "model.norm.weight");
     if (owned.weights.lm_head) |head| {
         try copyTensorIntoWeight(head.values, tensors, data, "lm_head.weight");
+        advanceLoadProgress(progress, &completed_steps, total_steps, "lm_head.weight");
     }
 }
 
-fn loadGgufIntoOwnedModel(owned: *OwnedModel, file: gguf.File, bytes: []const u8) !void {
+fn loadGgufIntoOwnedModel(owned: *OwnedModel, file: gguf.File, bytes: []const u8, progress: LoadProgress) !void {
     const config = owned.config;
     if (!config.supportsDenseRunner()) return Error.UnsupportedModelArchitecture;
     if (config.qkv_bias) return Error.UnsupportedModelArchitecture;
 
+    const total_steps = weightLoadStepCount(owned);
+    var completed_steps: usize = 0;
+    progress.report(completed_steps, total_steps, "start");
+
     try copyGgufTensorIntoWeight(owned.weights.token_embedding.values, file, bytes, "token_embd.weight");
+    advanceLoadProgress(progress, &completed_steps, total_steps, "token_embd.weight");
 
     var name_buf: [96]u8 = undefined;
     for (owned.layers, 0..) |layer, i| {
-        try copyGgufTensorIntoWeight(layer.input_norm, file, bytes, try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_norm.weight", .{i}));
-        try copyGgufTensorIntoWeight(layer.q_proj.values, file, bytes, try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_q.weight", .{i}));
-        try copyGgufTensorIntoWeight(layer.k_proj.values, file, bytes, try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_k.weight", .{i}));
-        try copyGgufTensorIntoWeight(layer.v_proj.values, file, bytes, try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_v.weight", .{i}));
-        try copyGgufTensorIntoWeight(layer.o_proj.values, file, bytes, try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_output.weight", .{i}));
-        try copyGgufTensorIntoWeight(layer.post_attention_norm, file, bytes, try std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_norm.weight", .{i}));
-        try copyGgufTensorIntoWeight(layer.gate_proj.values, file, bytes, try std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_gate.weight", .{i}));
-        try copyGgufTensorIntoWeight(layer.up_proj.values, file, bytes, try std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_up.weight", .{i}));
-        try copyGgufTensorIntoWeight(layer.down_proj.values, file, bytes, try std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_down.weight", .{i}));
+        var name = try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_norm.weight", .{i});
+        try copyGgufTensorIntoWeight(layer.input_norm, file, bytes, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_q.weight", .{i});
+        try copyGgufTensorIntoWeight(layer.q_proj.values, file, bytes, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_k.weight", .{i});
+        try copyGgufTensorIntoWeight(layer.k_proj.values, file, bytes, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_v.weight", .{i});
+        try copyGgufTensorIntoWeight(layer.v_proj.values, file, bytes, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_output.weight", .{i});
+        try copyGgufTensorIntoWeight(layer.o_proj.values, file, bytes, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_norm.weight", .{i});
+        try copyGgufTensorIntoWeight(layer.post_attention_norm, file, bytes, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_gate.weight", .{i});
+        try copyGgufTensorIntoWeight(layer.gate_proj.values, file, bytes, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_up.weight", .{i});
+        try copyGgufTensorIntoWeight(layer.up_proj.values, file, bytes, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
+
+        name = try std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_down.weight", .{i});
+        try copyGgufTensorIntoWeight(layer.down_proj.values, file, bytes, name);
+        advanceLoadProgress(progress, &completed_steps, total_steps, name);
     }
 
     try copyGgufTensorIntoWeight(owned.weights.final_norm, file, bytes, "output_norm.weight");
+    advanceLoadProgress(progress, &completed_steps, total_steps, "output_norm.weight");
     if (owned.weights.lm_head) |head| {
         try copyGgufTensorIntoWeight(head.values, file, bytes, "output.weight");
+        advanceLoadProgress(progress, &completed_steps, total_steps, "output.weight");
     }
+}
+
+fn weightLoadStepCount(owned: *const OwnedModel) usize {
+    var per_layer: usize = 9;
+    if (owned.config.qkv_bias) per_layer += 3;
+
+    var total: usize = 1 + owned.layers.len * per_layer + 1;
+    if (owned.weights.lm_head != null) total += 1;
+    return total;
+}
+
+fn advanceLoadProgress(progress: LoadProgress, completed: *usize, total: usize, name: []const u8) void {
+    completed.* += 1;
+    progress.report(completed.*, total, name);
 }
 
 fn copyGgufTensorIntoWeight(weight: WeightSlice, file: gguf.File, bytes: []const u8, name: []const u8) !void {

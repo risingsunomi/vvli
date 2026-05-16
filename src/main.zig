@@ -5,6 +5,8 @@ const generator = @import("generator");
 const hf_downloader = @import("hf_downloader");
 const llm = @import("llm");
 const tokenizer_mod = @import("tokenizer");
+const vision = @import("vision");
+const vlm = @import("vlm");
 
 const ModelFormat = enum {
     auto,
@@ -17,8 +19,10 @@ const Cli = struct {
     revision: []const u8 = "main",
     cache_root: []const u8 = ".vvli-cache",
     weights_file: ?[]const u8 = null,
+    mmproj_file: ?[]const u8 = null,
     format: ModelFormat = .auto,
     prompt: ?[]const u8 = null,
+    image_path: ?[]const u8 = null,
     max_new_tokens: usize = 64,
     context: usize = 512,
     threads: usize = 0,
@@ -37,8 +41,8 @@ const Cli = struct {
 
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| {
-        try writeAppError(init.io, err);
-        return err;
+        writeAppError(init.io, err) catch {};
+        std.process.exit(1);
     };
 }
 
@@ -63,6 +67,13 @@ fn run(init: std.process.Init) !void {
         try stdout.flush();
         return;
     };
+
+    if (cli.image_path) |image_path| {
+        const image = try vision.inspectPath(io, image_path);
+        try runVisionPrompt(allocator, io, cli, prompt, image);
+        return;
+    }
+
     const format = cli.resolveFormat();
 
     const repo: hf_downloader.ModelRef = .{ .repo_id = cli.repo_id, .revision = cli.revision };
@@ -90,14 +101,20 @@ fn run(init: std.process.Init) !void {
     const weights_path = try std.fs.path.join(allocator, &.{ snapshot.directory, weights_file });
     defer allocator.free(weights_path);
 
+    var progress_context = LoadProgressContext{ .io = io };
+    const progress = llm.LoadProgress{
+        .context = &progress_context,
+        .on_step = reportLoadProgress,
+    };
+
     var model = switch (format) {
         .safetensors => safetensors: {
             const config_path = try std.fs.path.join(allocator, &.{ snapshot.directory, "config.json" });
             defer allocator.free(config_path);
             const config = try llm.Config.loadFromFile(allocator, io, config_path);
-            break :safetensors try llm.loadOwnedFromSafetensorsFile(allocator, io, config, .bf16, weights_path);
+            break :safetensors try llm.loadOwnedFromSafetensorsFileWithProgress(allocator, io, config, .bf16, weights_path, progress);
         },
-        .gguf => try llm.loadOwnedFromGgufFile(allocator, io, .bf16, weights_path),
+        .gguf => try llm.loadOwnedFromGgufFileWithProgress(allocator, io, .bf16, weights_path, progress),
         .auto => unreachable,
     };
     defer model.deinit();
@@ -156,6 +173,116 @@ fn run(init: std.process.Init) !void {
     try stdout.flush();
 }
 
+fn runVisionPrompt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cli: Cli,
+    prompt: []const u8,
+    image: vision.ImageInput,
+) !void {
+    const format = cli.resolveFormat();
+    if (format != .gguf) return error.VisionGgufRequired;
+
+    const repo: hf_downloader.ModelRef = .{ .repo_id = cli.repo_id, .revision = cli.revision };
+
+    var repo_files: ?[][]u8 = null;
+    defer if (repo_files) |files| hf_downloader.freeRepoFileList(allocator, files);
+
+    var owned_weights_file: ?[]u8 = null;
+    defer if (owned_weights_file) |file| allocator.free(file);
+
+    var owned_mmproj_file: ?[]u8 = null;
+    defer if (owned_mmproj_file) |file| allocator.free(file);
+
+    const weights_file = try resolveVisionWeightsFile(allocator, io, cli, repo, &repo_files, &owned_weights_file);
+    const mmproj_file = try resolveMmprojFile(allocator, io, cli, repo, &repo_files, &owned_mmproj_file);
+
+    const required_files = try allocator.alloc([]const u8, 2);
+    defer allocator.free(required_files);
+    required_files[0] = weights_file;
+    required_files[1] = mmproj_file;
+
+    var snapshot = if (cli.download)
+        try hf_downloader.ensureSnapshotForFiles(allocator, io, cli.cache_root, repo, required_files, &.{})
+    else
+        hf_downloader.Snapshot{
+            .allocator = allocator,
+            .repo = repo,
+            .directory = try hf_downloader.snapshotDir(allocator, cli.cache_root, repo),
+        };
+    defer snapshot.deinit();
+
+    const weights_path = try std.fs.path.join(allocator, &.{ snapshot.directory, weights_file });
+    defer allocator.free(weights_path);
+
+    const mmproj_path = try std.fs.path.join(allocator, &.{ snapshot.directory, mmproj_file });
+    defer allocator.free(mmproj_path);
+
+    var plan = try vlm.loadNativePlan(allocator, io, weights_path, mmproj_path, image);
+    defer plan.deinit();
+
+    try writeLinkedImage(io, image);
+    try writeNativeVisionPlan(io, weights_file, mmproj_file, plan);
+    if (plan.projector_quantized_tensors != 0) return error.UnsupportedProjectorDType;
+
+    _ = prompt;
+    return error.NativeVisionExecutionIncomplete;
+}
+
+const LoadProgressContext = struct {
+    io: std.Io,
+    last_percent: usize = std.math.maxInt(usize),
+
+    fn report(self: *LoadProgressContext, completed: usize, total: usize, name: []const u8) !void {
+        _ = name;
+        const percent = if (total == 0) 100 else completed * 100 / total;
+        if (completed != total and percent == self.last_percent) return;
+        self.last_percent = percent;
+
+        var stderr_buffer: [128]u8 = undefined;
+        var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);
+        try stderr_writer.interface.print("\rloading weights: {d}% ({d}/{d})", .{ percent, completed, total });
+        if (completed == total) try stderr_writer.interface.writeAll("\n");
+        try stderr_writer.interface.flush();
+    }
+};
+
+fn reportLoadProgress(context: ?*anyopaque, completed: usize, total: usize, name: []const u8) void {
+    if (context) |ptr| {
+        const progress_context: *LoadProgressContext = @ptrCast(@alignCast(ptr));
+        progress_context.report(completed, total, name) catch {};
+    }
+}
+
+fn writeLinkedImage(io: std.Io, image: vision.ImageInput) !void {
+    var stderr_buffer: [512]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    try stderr_writer.interface.print(
+        "linked image: {s} ({d} bytes, {s})\n",
+        .{ image.path, image.byte_len, @tagName(image.format) },
+    );
+    try stderr_writer.interface.flush();
+}
+
+fn writeNativeVisionPlan(io: std.Io, weights_file: []const u8, mmproj_file: []const u8, plan: vlm.NativePlan) !void {
+    var stderr_buffer: [512]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    try stderr_writer.interface.print(
+        "native vision: text={s} ({s}, {d} tensors), mmproj={s} ({s}/{s}, {d}/{d} native tensors)\n",
+        .{
+            weights_file,
+            plan.language_architecture,
+            plan.language_tensor_count,
+            mmproj_file,
+            plan.projector_architecture,
+            plan.projector_type,
+            plan.projector_native_tensors,
+            plan.projector_tensor_count,
+        },
+    );
+    try stderr_writer.interface.flush();
+}
+
 fn writeAppError(io: std.Io, err: anyerror) !void {
     var stderr_buffer: [2048]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
@@ -165,8 +292,16 @@ fn writeAppError(io: std.Io, err: anyerror) !void {
         error.MissingWeightsFile => try stderr.writeAll("vvli: GGUF requires a weight file when one cannot be selected automatically. Pass --weights <file>. For example: --weights Llama-3.2-1B-Instruct-BF16.gguf\n"),
         error.QuantizedGgufUnsupported => try stderr.writeAll("vvli: this GGUF repo only exposed quantized GGUF files for auto-selection. Quantized GGUF dequant kernels are not implemented yet; pass a BF16/F16/F32 .gguf file if the repo has one.\n"),
         error.MoeRuntimeUnsupported => try stderr.writeAll("vvli: this model is MoE. Config detection is wired, but router/top-k expert execution is not implemented yet, so it is not routed through the dense runner.\n"),
+        error.VisionGgufRequired => try stderr.writeAll("vvli: --image currently requires a GGUF vision-language repo. Pass something like --repo unsloth/Qwen3.5-9B-GGUF, or use --format gguf with --weights and --mmproj.\n"),
+        error.MissingMmprojFile => try stderr.writeAll("vvli: could not select an mmproj GGUF projector from this repo. Pass --mmproj <file> or use a VLM GGUF repo that contains mmproj-F16.gguf/mmproj-BF16.gguf.\n"),
+        error.NativeVisionExecutionIncomplete => try stderr.writeAll("vvli: native VLM loading is wired, but execution still needs Zig image decode/resize, patch embedding, projector forward pass, and multimodal token insertion before generation can run.\n"),
         error.ShardedSafetensorsUnsupported => try stderr.writeAll("vvli: this repo uses sharded safetensors. Shard index parsing and multi-file safetensors loading are not implemented yet.\n"),
+        error.UnsupportedImageFormat => try stderr.writeAll("vvli: unsupported image format. Pass a .jpg, .jpeg, .png, .webp, or .bmp path.\n"),
+        error.InvalidImageFile => try stderr.writeAll("vvli: image file extension and file header do not match a supported image format.\n"),
+        error.EmptyImageFile => try stderr.writeAll("vvli: image file is empty.\n"),
         error.UnsupportedDType => try stderr.writeAll("vvli: unsupported tensor dtype. Native BF16/F16/F32 GGUF tensors are supported first; quantized GGUF tensors still need dequant kernels.\n"),
+        error.UnsupportedProjectorDType => try stderr.writeAll("vvli: unsupported projector dtype. The native VLM path currently requires BF16/F16/F32 mmproj tensors.\n"),
+        error.UnsupportedModelArchitecture => try stderr.writeAll("vvli: this model architecture is not implemented in the CPU runner yet.\n"),
         error.DownloadFailed => try stderr.writeAll("vvli: download failed. Check the repo, revision, selected --format, and --weights file name.\n"),
         else => {},
     }
@@ -203,6 +338,43 @@ fn resolveWeightsFile(
         },
         .auto => unreachable,
     }
+}
+
+fn resolveVisionWeightsFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cli: Cli,
+    repo: hf_downloader.ModelRef,
+    repo_files: *?[][]u8,
+    owned_weights_file: *?[]u8,
+) ![]const u8 {
+    if (cli.weights_file) |file| return file;
+    if (!cli.download) return error.MissingWeightsFile;
+
+    const files = try getRepoFiles(allocator, io, repo, repo_files);
+    const selected = hf_downloader.chooseDefaultNativeGguf(files) orelse {
+        if (hf_downloader.hasGguf(files)) return error.QuantizedGgufUnsupported;
+        return error.MissingWeightsFile;
+    };
+    owned_weights_file.* = try allocator.dupe(u8, selected);
+    return owned_weights_file.*.?;
+}
+
+fn resolveMmprojFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cli: Cli,
+    repo: hf_downloader.ModelRef,
+    repo_files: *?[][]u8,
+    owned_mmproj_file: *?[]u8,
+) ![]const u8 {
+    if (cli.mmproj_file) |file| return file;
+    if (!cli.download) return error.MissingMmprojFile;
+
+    const files = try getRepoFiles(allocator, io, repo, repo_files);
+    const selected = hf_downloader.chooseDefaultMmprojGguf(files) orelse return error.MissingMmprojFile;
+    owned_mmproj_file.* = try allocator.dupe(u8, selected);
+    return owned_mmproj_file.*.?;
 }
 
 fn resolveRequiredFiles(
@@ -304,6 +476,10 @@ fn parseArgs(args: []const []const u8) !Cli {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
             cli.weights_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--mmproj")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            cli.mmproj_file = args[i];
         } else if (std.mem.eql(u8, arg, "--format")) {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
@@ -312,6 +488,10 @@ fn parseArgs(args: []const []const u8) !Cli {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
             cli.prompt = args[i];
+        } else if (std.mem.eql(u8, arg, "--image")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            cli.image_path = args[i];
         } else if (std.mem.eql(u8, arg, "--max-new-tokens")) {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
@@ -369,6 +549,7 @@ fn writeUsage(writer: *std.Io.Writer) !void {
         \\  zig build run -- --repo <owner/model> --prompt "hello"
         \\  zig build run -- --repo unsloth/Qwen2.5-0.5B-Instruct --prompt "Explain CPU inference."
         \\  zig build run -- --repo unsloth/Llama-3.2-1B-Instruct-GGUF --prompt "hello"
+        \\  zig build run -- --repo unsloth/Qwen3.5-9B-GGUF --image ./image.jpg --prompt "Describe this image."
         \\
         \\options:
         \\  --repo <id>              Hugging Face repo id. Default: unsloth/Qwen2.5-0.5B-Instruct
@@ -376,7 +557,9 @@ fn writeUsage(writer: *std.Io.Writer) !void {
         \\  --cache <dir>            Local model cache. Default: .vvli-cache
         \\  --format <type>          auto, safetensors, or gguf. Default: auto
         \\  --weights <file>         Weight file in the repo. GGUF auto-selects BF16/F16/F32 when possible
+        \\  --mmproj <file>          Multimodal projector file for --image GGUF runs
         \\  --prompt <text>          Prompt text
+        \\  --image <path>           Run the native vision-language path
         \\  --max-new-tokens <n>     Default: 64
         \\  --ctx <n>                KV cache length. Default: 512
         \\  --threads <n>            0 uses host CPU count. Default: 0
@@ -409,4 +592,10 @@ test "auto format detects gguf repos and files" {
 
     const cli_default: Cli = .{ .repo_id = "org/model" };
     try std.testing.expectEqual(ModelFormat.safetensors, cli_default.resolveFormat());
+}
+
+test "parses image path option" {
+    const cli = try parseArgs(&.{ "vvli", "--prompt", "describe", "--image", "frame.PNG", "--mmproj", "mmproj-F16.gguf" });
+    try std.testing.expectEqualStrings("frame.PNG", cli.image_path.?);
+    try std.testing.expectEqualStrings("mmproj-F16.gguf", cli.mmproj_file.?);
 }
