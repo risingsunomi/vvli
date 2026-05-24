@@ -28,6 +28,13 @@ const Cli = struct {
     threads: usize = 0,
     download: bool = true,
     chat_template: bool = true,
+    stream: bool = true,
+    temperature: f32 = 0.8,
+    top_p: f32 = 0.95,
+    top_k: usize = 40,
+    repeat_penalty: f32 = 1.10,
+    repeat_last_n: usize = 64,
+    seed: ?u64 = null,
 
     fn resolveFormat(self: Cli) ModelFormat {
         if (self.format != .auto) return self.format;
@@ -67,6 +74,7 @@ fn run(init: std.process.Init) !void {
         try stdout.flush();
         return;
     };
+    try validateCli(cli);
 
     if (cli.image_path) |image_path| {
         const image = try vision.inspectPath(io, image_path);
@@ -152,24 +160,61 @@ fn run(init: std.process.Init) !void {
         .preload_layers_ahead = 1,
     });
 
-    const generated = try generator.generateGreedyMeasured(allocator, io, &runner, prompt_tokens, .{
+    const generation_options = generator.Options{
         .max_new_tokens = cli.max_new_tokens,
         .eos_token_id = tokenizer.eos_token_id orelse model.config.eos_token_id,
-    });
-    defer allocator.free(generated.tokens);
+        .temperature = cli.temperature,
+        .top_p = cli.top_p,
+        .top_k = cli.top_k,
+        .repeat_penalty = cli.repeat_penalty,
+        .repeat_last_n = cli.repeat_last_n,
+        .seed = cli.seed,
+    };
 
-    const text = try tokenizer.decode(allocator, generated.tokens);
-    defer allocator.free(text);
+    if (cli.stream) {
+        var stream_context = StreamContext{
+            .tokenizer = &tokenizer,
+            .writer = stdout,
+            .eos_token_id = generation_options.eos_token_id,
+        };
+        const generated = try generator.generateGreedyMeasuredStreaming(
+            allocator,
+            io,
+            &runner,
+            prompt_tokens,
+            generation_options,
+            .{
+                .context = &stream_context,
+                .on_token = streamGeneratedToken,
+            },
+        );
+        defer allocator.free(generated.tokens);
 
-    try stdout.print(
-        "{s}\n\n[{d} output tokens | {d:.2} tok/sec | {d:.2}s decode]\n",
-        .{
-            text,
-            generated.stats.generated_tokens,
-            generated.stats.decodeTokensPerSecond(),
-            generated.stats.decodeSeconds(),
-        },
-    );
+        try stdout.print(
+            "\n\n[{d} output tokens | {d:.2} tok/sec | {d:.2}s decode]\n",
+            .{
+                generated.stats.generated_tokens,
+                generated.stats.decodeTokensPerSecond(),
+                generated.stats.decodeSeconds(),
+            },
+        );
+    } else {
+        const generated = try generator.generateGreedyMeasured(allocator, io, &runner, prompt_tokens, generation_options);
+        defer allocator.free(generated.tokens);
+
+        const text = try tokenizer.decode(allocator, generated.tokens);
+        defer allocator.free(text);
+
+        try stdout.print(
+            "{s}\n\n[{d} output tokens | {d:.2} tok/sec | {d:.2}s decode]\n",
+            .{
+                text,
+                generated.stats.generated_tokens,
+                generated.stats.decodeTokensPerSecond(),
+                generated.stats.decodeSeconds(),
+            },
+        );
+    }
     try stdout.flush();
 }
 
@@ -225,8 +270,36 @@ fn runVisionPrompt(
     try writeNativeVisionPlan(io, weights_file, mmproj_file, plan);
     if (plan.projector_quantized_tensors != 0) return error.UnsupportedProjectorDType;
 
-    _ = prompt;
-    return error.NativeVisionExecutionIncomplete;
+    var decoded = try vlm.decodeResizeForPlan(allocator, plan);
+    defer decoded.deinit();
+
+    var patch_embedding = try vlm.loadPatchEmbeddingFromFile(allocator, io, mmproj_path, plan);
+    defer patch_embedding.deinit();
+
+    var patch_features = try patch_embedding.forwardWithOptions(allocator, &decoded, .{ .thread_count = cli.threads });
+    defer patch_features.deinit();
+
+    try writeNativeVisionStep(io, "running qwen3 vision transformer");
+    var transformer = try vlm.loadQwen3VisionTransformerFromFile(allocator, io, mmproj_path, plan);
+    defer transformer.deinit();
+
+    var vision_features = try transformer.forward(allocator, &patch_features, .{ .thread_count = cli.threads });
+    defer vision_features.deinit();
+
+    var projector = try vlm.loadProjectorFromFile(allocator, io, mmproj_path, plan);
+    defer projector.deinit();
+
+    var projected = try projector.forward(allocator, &vision_features, .{ .thread_count = cli.threads });
+    defer projected.deinit();
+
+    var tokenizer = try tokenizer_mod.Tokenizer.loadFromGgufFile(allocator, io, weights_path);
+    defer tokenizer.deinit();
+
+    var multimodal_prompt = try vlm.buildQwenImagePrompt(allocator, &tokenizer, prompt, projected.tokens);
+    defer multimodal_prompt.deinit();
+
+    try writeNativeVisionRun(io, decoded, patch_features, vision_features, projected, multimodal_prompt);
+    try writeNativeVisionBoundary(io);
 }
 
 const LoadProgressContext = struct {
@@ -246,6 +319,22 @@ const LoadProgressContext = struct {
         try stderr_writer.interface.flush();
     }
 };
+
+const StreamContext = struct {
+    tokenizer: *const tokenizer_mod.Tokenizer,
+    writer: *std.Io.Writer,
+    eos_token_id: ?u32,
+};
+
+fn streamGeneratedToken(context: ?*anyopaque, token: u32, index: usize) !void {
+    _ = index;
+    const stream_context: *StreamContext = @ptrCast(@alignCast(context.?));
+    if (stream_context.eos_token_id) |eos| {
+        if (token == eos) return;
+    }
+    try stream_context.tokenizer.writeDecodedToken(stream_context.writer, token);
+    try stream_context.writer.flush();
+}
 
 fn reportLoadProgress(context: ?*anyopaque, completed: usize, total: usize, name: []const u8) void {
     if (context) |ptr| {
@@ -268,7 +357,7 @@ fn writeNativeVisionPlan(io: std.Io, weights_file: []const u8, mmproj_file: []co
     var stderr_buffer: [512]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
     try stderr_writer.interface.print(
-        "native vision: text={s} ({s}, {d} tensors), mmproj={s} ({s}/{s}, {d}/{d} native tensors)\n",
+        "native vision: text={s} ({s}, {d} tensors), mmproj={s} ({s}/{s}, {d}/{d} native tensors), image={d}px patch={d} merge={d}\n",
         .{
             weights_file,
             plan.language_architecture,
@@ -278,7 +367,60 @@ fn writeNativeVisionPlan(io: std.Io, weights_file: []const u8, mmproj_file: []co
             plan.projector_type,
             plan.projector_native_tensors,
             plan.projector_tensor_count,
+            plan.image_size orelse 0,
+            plan.patch_size orelse 0,
+            plan.spatial_merge_size orelse 0,
         },
+    );
+    try stderr_writer.interface.flush();
+}
+
+fn writeNativeVisionRun(
+    io: std.Io,
+    decoded: vision.RgbImage,
+    patch_features: vlm.ImageEmbeddings,
+    vision_features: vlm.ImageEmbeddings,
+    projected: vlm.ImageEmbeddings,
+    prompt: vlm.MultimodalPrompt,
+) !void {
+    var stderr_buffer: [768]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    try stderr_writer.interface.print(
+        "native vision prepared: decoded={d}x{d} rgb-f32, patches={d}x{d} ({d} tokens x {d}), transformer={d} tokens x {d}, projected={d}x{d} ({d} tokens x {d}), prompt_tokens={d}, image_token_id={d}, image_slots={d}@{d}\n",
+        .{
+            decoded.width,
+            decoded.height,
+            patch_features.grid_width,
+            patch_features.grid_height,
+            patch_features.tokens,
+            patch_features.dimensions,
+            vision_features.tokens,
+            vision_features.dimensions,
+            projected.grid_width,
+            projected.grid_height,
+            projected.tokens,
+            projected.dimensions,
+            prompt.tokens.len,
+            prompt.image_token_id,
+            prompt.image_token_count,
+            prompt.image_start,
+        },
+    );
+    try stderr_writer.interface.flush();
+}
+
+fn writeNativeVisionStep(io: std.Io, message: []const u8) !void {
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    try stderr_writer.interface.print("native vision: {s}\n", .{message});
+    try stderr_writer.interface.flush();
+}
+
+fn writeNativeVisionBoundary(io: std.Io) !void {
+    var stderr_buffer: [512]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    try stderr_writer.interface.writeAll(
+        "native vision status: vision transformer, M-RoPE, projector, and multimodal token insertion completed. Generation is not started yet because the Qwen3.5 text runtime still needs qwen35/SSM and quantized GGUF matmul support.\n",
     );
     try stderr_writer.interface.flush();
 }
@@ -294,14 +436,18 @@ fn writeAppError(io: std.Io, err: anyerror) !void {
         error.MoeRuntimeUnsupported => try stderr.writeAll("vvli: this model is MoE. Config detection is wired, but router/top-k expert execution is not implemented yet, so it is not routed through the dense runner.\n"),
         error.VisionGgufRequired => try stderr.writeAll("vvli: --image currently requires a GGUF vision-language repo. Pass something like --repo unsloth/Qwen3.5-9B-GGUF, or use --format gguf with --weights and --mmproj.\n"),
         error.MissingMmprojFile => try stderr.writeAll("vvli: could not select an mmproj GGUF projector from this repo. Pass --mmproj <file> or use a VLM GGUF repo that contains mmproj-F16.gguf/mmproj-BF16.gguf.\n"),
-        error.NativeVisionExecutionIncomplete => try stderr.writeAll("vvli: native VLM loading is wired, but execution still needs Zig image decode/resize, patch embedding, projector forward pass, and multimodal token insertion before generation can run.\n"),
+        error.NativeVisionExecutionIncomplete => try stderr.writeAll("vvli: native image decode/resize, Qwen3VL vision transformer/M-RoPE, projector MLP, and multimodal token insertion are wired. Image-aware Qwen3.5 generation still needs qwen35/SSM text runtime and quantized GGUF matmul support.\n"),
+        error.MissingProjectorTensor => try stderr.writeAll("vvli: mmproj is missing expected projector tensors such as mm.0.weight/mm.2.weight for the native VLM path.\n"),
+        error.MissingImagePadToken => try stderr.writeAll("vvli: tokenizer does not expose the expected <|image_pad|> special token for multimodal insertion.\n"),
         error.ShardedSafetensorsUnsupported => try stderr.writeAll("vvli: this repo uses sharded safetensors. Shard index parsing and multi-file safetensors loading are not implemented yet.\n"),
         error.UnsupportedImageFormat => try stderr.writeAll("vvli: unsupported image format. Pass a .jpg, .jpeg, .png, .webp, or .bmp path.\n"),
         error.InvalidImageFile => try stderr.writeAll("vvli: image file extension and file header do not match a supported image format.\n"),
+        error.NativeImageDecodeUnsupported => try stderr.writeAll("vvli: native image decode/resize currently uses ImageIO on macOS. Non-Apple image decoders are planned.\n"),
         error.EmptyImageFile => try stderr.writeAll("vvli: image file is empty.\n"),
         error.UnsupportedDType => try stderr.writeAll("vvli: unsupported tensor dtype. Native BF16/F16/F32 GGUF tensors are supported first; quantized GGUF tensors still need dequant kernels.\n"),
         error.UnsupportedProjectorDType => try stderr.writeAll("vvli: unsupported projector dtype. The native VLM path currently requires BF16/F16/F32 mmproj tensors.\n"),
         error.UnsupportedModelArchitecture => try stderr.writeAll("vvli: this model architecture is not implemented in the CPU runner yet.\n"),
+        error.InvalidSamplingOptions => try stderr.writeAll("vvli: invalid sampling options. Use temperature >= 0, 0 < top-p <= 1, and repeat-penalty >= 1.\n"),
         error.DownloadFailed => try stderr.writeAll("vvli: download failed. Check the repo, revision, selected --format, and --weights file name.\n"),
         else => {},
     }
@@ -504,8 +650,41 @@ fn parseArgs(args: []const []const u8) !Cli {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
             cli.threads = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--temperature")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            cli.temperature = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, arg, "--top-p")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            cli.top_p = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, arg, "--top-k")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            cli.top_k = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--repeat-penalty")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            cli.repeat_penalty = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, arg, "--repeat-last-n")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            cli.repeat_last_n = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--seed")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            cli.seed = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--greedy")) {
+            cli.temperature = 0.0;
+            cli.top_p = 1.0;
+            cli.top_k = 1;
+            cli.repeat_penalty = 1.0;
         } else if (std.mem.eql(u8, arg, "--no-download")) {
             cli.download = false;
+        } else if (std.mem.eql(u8, arg, "--stream")) {
+            cli.stream = true;
+        } else if (std.mem.eql(u8, arg, "--no-stream")) {
+            cli.stream = false;
         } else if (std.mem.eql(u8, arg, "--raw")) {
             cli.chat_template = false;
         } else if (std.mem.startsWith(u8, arg, "--")) {
@@ -525,6 +704,12 @@ fn parseFormat(text: []const u8) ?ModelFormat {
     if (std.mem.eql(u8, text, "safetensors")) return .safetensors;
     if (std.mem.eql(u8, text, "gguf")) return .gguf;
     return null;
+}
+
+fn validateCli(cli: Cli) !void {
+    if (cli.temperature < 0.0 or std.math.isNan(cli.temperature)) return error.InvalidSamplingOptions;
+    if (cli.top_p <= 0.0 or cli.top_p > 1.0 or std.math.isNan(cli.top_p)) return error.InvalidSamplingOptions;
+    if (cli.repeat_penalty < 1.0 or std.math.isNan(cli.repeat_penalty)) return error.InvalidSamplingOptions;
 }
 
 fn renderChatPrompt(allocator: std.mem.Allocator, architecture: llm.Architecture, prompt: []const u8) ![]u8 {
@@ -549,7 +734,7 @@ fn writeUsage(writer: *std.Io.Writer) !void {
         \\  zig build run -- --repo <owner/model> --prompt "hello"
         \\  zig build run -- --repo unsloth/Qwen2.5-0.5B-Instruct --prompt "Explain CPU inference."
         \\  zig build run -- --repo unsloth/Llama-3.2-1B-Instruct-GGUF --prompt "hello"
-        \\  zig build run -- --repo unsloth/Qwen3.5-9B-GGUF --image ./image.jpg --prompt "Describe this image."
+        \\  zig build run -- --repo unsloth/Qwen3.5-9B-GGUF --weights Qwen3.5-9B-Q4_0.gguf --mmproj mmproj-F16.gguf --image ./image.jpg --prompt "Describe this image."
         \\
         \\options:
         \\  --repo <id>              Hugging Face repo id. Default: unsloth/Qwen2.5-0.5B-Instruct
@@ -563,7 +748,16 @@ fn writeUsage(writer: *std.Io.Writer) !void {
         \\  --max-new-tokens <n>     Default: 64
         \\  --ctx <n>                KV cache length. Default: 512
         \\  --threads <n>            0 uses host CPU count. Default: 0
+        \\  --temperature <f>        Sampling temperature. 0 forces greedy. Default: 0.8
+        \\  --top-p <f>              Nucleus sampling threshold. Default: 0.95
+        \\  --top-k <n>              Candidate cap before top-p. 0 disables. Default: 40
+        \\  --repeat-penalty <f>     Penalize recent token repeats. 1 disables. Default: 1.10
+        \\  --repeat-last-n <n>      Recent prompt/output window for repeat penalty. Default: 64
+        \\  --seed <n>               Fixed sampling seed
+        \\  --greedy                 Shortcut for temperature 0, top-p 1, top-k 1, repeat penalty 1
         \\  --no-download            Use the cache only
+        \\  --stream                 Stream generated text as tokens are decoded. Default
+        \\  --no-stream              Decode and print only after generation completes
         \\  --raw                    Do not wrap prompt in model chat markers
         \\
     );
@@ -598,4 +792,44 @@ test "parses image path option" {
     const cli = try parseArgs(&.{ "vvli", "--prompt", "describe", "--image", "frame.PNG", "--mmproj", "mmproj-F16.gguf" });
     try std.testing.expectEqualStrings("frame.PNG", cli.image_path.?);
     try std.testing.expectEqualStrings("mmproj-F16.gguf", cli.mmproj_file.?);
+}
+
+test "streaming is enabled by default and can be disabled" {
+    const default_cli = try parseArgs(&.{ "vvli", "--prompt", "hello" });
+    try std.testing.expect(default_cli.stream);
+
+    const disabled = try parseArgs(&.{ "vvli", "--prompt", "hello", "--no-stream" });
+    try std.testing.expect(!disabled.stream);
+}
+
+test "parses sampling options" {
+    const cli = try parseArgs(&.{
+        "vvli",
+        "--prompt",
+        "hello",
+        "--temperature",
+        "0.7",
+        "--top-p",
+        "0.9",
+        "--top-k",
+        "20",
+        "--repeat-penalty",
+        "1.2",
+        "--repeat-last-n",
+        "32",
+        "--seed",
+        "1234",
+    });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), cli.temperature, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), cli.top_p, 1e-6);
+    try std.testing.expectEqual(@as(usize, 20), cli.top_k);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.2), cli.repeat_penalty, 1e-6);
+    try std.testing.expectEqual(@as(usize, 32), cli.repeat_last_n);
+    try std.testing.expectEqual(@as(u64, 1234), cli.seed.?);
+
+    const greedy = try parseArgs(&.{ "vvli", "--prompt", "hello", "--greedy" });
+    try std.testing.expectEqual(@as(f32, 0.0), greedy.temperature);
+    try std.testing.expectEqual(@as(f32, 1.0), greedy.top_p);
+    try std.testing.expectEqual(@as(usize, 1), greedy.top_k);
+    try std.testing.expectEqual(@as(f32, 1.0), greedy.repeat_penalty);
 }

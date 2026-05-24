@@ -11,6 +11,11 @@ pub const Error = error{
     UnknownToken,
 };
 
+const TokenEntry = struct {
+    token: []const u8,
+    special: bool,
+};
+
 pub const Tokenizer = struct {
     allocator: Allocator,
     token_to_id: std.StringHashMap(u32),
@@ -184,16 +189,26 @@ pub const Tokenizer = struct {
         errdefer out.deinit();
 
         for (ids) |id| {
-            if (id >= self.id_to_token.len) return Error.MissingToken;
-            const token = self.id_to_token[id] orelse return Error.MissingToken;
-            if (self.special_token[id]) {
-                try out.appendSlice(token);
-            } else {
-                try appendByteLevelDecoded(&out, token);
-            }
+            try self.appendDecodedToken(&out, id);
         }
 
         return out.toOwnedSlice();
+    }
+
+    pub fn decodeToken(self: *const Tokenizer, allocator: Allocator, id: u32) ![]u8 {
+        var out = std.array_list.Managed(u8).init(allocator);
+        errdefer out.deinit();
+        try self.appendDecodedToken(&out, id);
+        return out.toOwnedSlice();
+    }
+
+    pub fn writeDecodedToken(self: *const Tokenizer, writer: *std.Io.Writer, id: u32) !void {
+        const entry = try self.tokenEntry(id);
+        if (entry.special) {
+            try writer.writeAll(entry.token);
+        } else {
+            try writeByteLevelDecoded(writer, entry.token);
+        }
     }
 
     fn addToken(self: *Tokenizer, token: []const u8, id: u32, special: bool) !void {
@@ -207,6 +222,24 @@ pub const Tokenizer = struct {
         self.id_to_token[id_index] = owned;
         self.special_token[id_index] = special;
         try self.token_to_id.put(owned, id);
+    }
+
+    fn appendDecodedToken(self: *const Tokenizer, out: *std.array_list.Managed(u8), id: u32) !void {
+        const entry = try self.tokenEntry(id);
+        if (entry.special) {
+            try out.appendSlice(entry.token);
+        } else {
+            try appendByteLevelDecoded(out, entry.token);
+        }
+    }
+
+    fn tokenEntry(self: *const Tokenizer, id: u32) Error!TokenEntry {
+        const id_index: usize = @intCast(id);
+        if (id_index >= self.id_to_token.len) return Error.MissingToken;
+        return .{
+            .token = self.id_to_token[id_index] orelse return Error.MissingToken,
+            .special = self.special_token[id_index],
+        };
     }
 
     fn addMerge(self: *Tokenizer, merge: std.json.Value, rank: u32) !void {
@@ -388,6 +421,16 @@ fn appendByteLevelDecoded(out: *std.array_list.Managed(u8), token: []const u8) !
     }
 }
 
+fn writeByteLevelDecoded(writer: *std.Io.Writer, token: []const u8) !void {
+    var view = try std.unicode.Utf8View.init(token);
+    var it = view.iterator();
+    var byte_buf: [1]u8 = undefined;
+    while (it.nextCodepoint()) |cp| {
+        byte_buf[0] = try unicodeToByte(cp);
+        try writer.writeAll(&byte_buf);
+    }
+}
+
 fn byteToUnicode(byte: u8) u21 {
     if (isByteVisible(byte)) return byte;
 
@@ -449,6 +492,10 @@ test "loads a minimal tokenizer json and round trips known tokens" {
     const text = try tok.decode(allocator, ids);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("hello world<|endoftext|>", text);
+
+    const one_token = try tok.decodeToken(allocator, 4);
+    defer allocator.free(one_token);
+    try std.testing.expectEqualStrings(" ", one_token);
 }
 
 test "special token matching prefers complete marker boundaries" {

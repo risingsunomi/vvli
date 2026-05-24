@@ -53,6 +53,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    if (target.result.os.tag == .macos) {
+        vision_mod.linkFramework("CoreFoundation", .{});
+        vision_mod.linkFramework("CoreGraphics", .{});
+        vision_mod.linkFramework("ImageIO", .{});
+    }
 
     const vlm_mod = b.addModule("vlm", .{
         .root_source_file = b.path("src/vlm.zig"),
@@ -60,6 +65,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "gguf", .module = gguf_mod },
+            .{ .name = "tensor", .module = tensor_mod },
+            .{ .name = "tokenizer", .module = tokenizer_mod },
             .{ .name = "vision", .module = vision_mod },
         },
     });

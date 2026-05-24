@@ -200,6 +200,35 @@ pub const File = struct {
         for (out) |*item| item.* = try reader.readString();
         return out;
     }
+
+    pub fn f32ArrayAlloc(self: File, allocator: Allocator, key: []const u8) ![]f32 {
+        const value = self.metadataValue(key) orelse return Error.InvalidGguf;
+        const array = switch (value) {
+            .array => |a| a,
+            else => return Error.InvalidGguf,
+        };
+
+        const out = try allocator.alloc(f32, array.len);
+        errdefer allocator.free(out);
+
+        var reader: Reader = .{ .bytes = self.bytes, .index = array.values_offset };
+        for (out) |*item| {
+            item.* = switch (array.item_type) {
+                .float32 => try reader.readFloat(f32),
+                .float64 => @floatCast(try reader.readFloat(f64)),
+                .uint8 => @floatFromInt(try reader.readInt(u8)),
+                .uint16 => @floatFromInt(try reader.readInt(u16)),
+                .uint32 => @floatFromInt(try reader.readInt(u32)),
+                .uint64 => @floatFromInt(try reader.readInt(u64)),
+                .int8 => @floatFromInt(try reader.readInt(i8)),
+                .int16 => @floatFromInt(try reader.readInt(i16)),
+                .int32 => @floatFromInt(try reader.readInt(i32)),
+                .int64 => @floatFromInt(try reader.readInt(i64)),
+                else => return Error.InvalidGguf,
+            };
+        }
+        return out;
+    }
 };
 
 pub fn parse(allocator: Allocator, bytes: []const u8) !File {

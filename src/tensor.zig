@@ -11,6 +11,7 @@ pub const simd_lanes: usize = std.simd.suggestVectorLength(f32) orelse 4;
 
 const Vec = @Vector(simd_lanes, f32);
 const AlignedData = []align(data_alignment_bytes) f32;
+const matmul_col_unroll = 4;
 
 pub const Error = error{
     InvalidShape,
@@ -299,16 +300,12 @@ pub const Tensor = struct {
         if (a.shape.dims_buf[1] != b.shape.dims_buf[0]) return Error.ShapeMismatch;
 
         const m = a.shape.dims_buf[0];
-        const k = a.shape.dims_buf[1];
         const n = b.shape.dims_buf[1];
 
         var out = try initUndefined(allocator, &.{ m, n });
         errdefer out.deinit(allocator);
 
-        var b_transposed = try initUndefined(allocator, &.{ n, k });
-        defer b_transposed.deinit(allocator);
-        try transpose2dInto(&b_transposed, b);
-        try matmulInto(&out, a, b, &b_transposed);
+        try matmulInto(&out, a, b, null);
         return out;
     }
 
@@ -472,6 +469,11 @@ pub const Conv2DOptions = struct {
 
 pub fn dot(a: []const f32, b: []const f32) Error!f32 {
     if (a.len != b.len) return Error.LengthMismatch;
+    return dotAssumeEqual(a, b);
+}
+
+pub fn dotAssumeEqual(a: []const f32, b: []const f32) f32 {
+    std.debug.assert(a.len == b.len);
     return dotUnchecked(a, b);
 }
 
@@ -512,8 +514,23 @@ inline fn storeVec(slice: []f32, index: usize, vec: Vec) void {
 }
 
 fn dotUnchecked(a: []const f32, b: []const f32) f32 {
-    var acc: Vec = @splat(0.0);
+    const unroll = 4;
+    const unrolled_lanes = simd_lanes * unroll;
+
+    var acc0: Vec = @splat(0.0);
+    var acc1: Vec = @splat(0.0);
+    var acc2: Vec = @splat(0.0);
+    var acc3: Vec = @splat(0.0);
+
     var i: usize = 0;
+    while (i + unrolled_lanes <= a.len) : (i += unrolled_lanes) {
+        acc0 += loadVec(a, i) * loadVec(b, i);
+        acc1 += loadVec(a, i + simd_lanes) * loadVec(b, i + simd_lanes);
+        acc2 += loadVec(a, i + simd_lanes * 2) * loadVec(b, i + simd_lanes * 2);
+        acc3 += loadVec(a, i + simd_lanes * 3) * loadVec(b, i + simd_lanes * 3);
+    }
+
+    var acc = (acc0 + acc1) + (acc2 + acc3);
     while (i + simd_lanes <= a.len) : (i += simd_lanes) {
         acc += loadVec(a, i) * loadVec(b, i);
     }
@@ -523,6 +540,66 @@ fn dotUnchecked(a: []const f32, b: []const f32) f32 {
         sum = @mulAdd(f32, a[i], b[i], sum);
     }
     return sum;
+}
+
+fn dot2Unchecked(a: []const f32, b0: []const f32, b1: []const f32) [2]f32 {
+    var acc0: Vec = @splat(0.0);
+    var acc1: Vec = @splat(0.0);
+
+    var i: usize = 0;
+    while (i + simd_lanes <= a.len) : (i += simd_lanes) {
+        const av = loadVec(a, i);
+        acc0 += av * loadVec(b0, i);
+        acc1 += av * loadVec(b1, i);
+    }
+
+    var sums = [2]f32{
+        @reduce(.Add, acc0),
+        @reduce(.Add, acc1),
+    };
+    while (i < a.len) : (i += 1) {
+        const av = a[i];
+        sums[0] = @mulAdd(f32, av, b0[i], sums[0]);
+        sums[1] = @mulAdd(f32, av, b1[i], sums[1]);
+    }
+    return sums;
+}
+
+fn dot4Unchecked(
+    a: []const f32,
+    b0: []const f32,
+    b1: []const f32,
+    b2: []const f32,
+    b3: []const f32,
+) [4]f32 {
+    var acc0: Vec = @splat(0.0);
+    var acc1: Vec = @splat(0.0);
+    var acc2: Vec = @splat(0.0);
+    var acc3: Vec = @splat(0.0);
+
+    var i: usize = 0;
+    while (i + simd_lanes <= a.len) : (i += simd_lanes) {
+        const av = loadVec(a, i);
+        acc0 += av * loadVec(b0, i);
+        acc1 += av * loadVec(b1, i);
+        acc2 += av * loadVec(b2, i);
+        acc3 += av * loadVec(b3, i);
+    }
+
+    var sums = [4]f32{
+        @reduce(.Add, acc0),
+        @reduce(.Add, acc1),
+        @reduce(.Add, acc2),
+        @reduce(.Add, acc3),
+    };
+    while (i < a.len) : (i += 1) {
+        const av = a[i];
+        sums[0] = @mulAdd(f32, av, b0[i], sums[0]);
+        sums[1] = @mulAdd(f32, av, b1[i], sums[1]);
+        sums[2] = @mulAdd(f32, av, b2[i], sums[2]);
+        sums[3] = @mulAdd(f32, av, b3[i], sums[3]);
+    }
+    return sums;
 }
 
 fn sumSquares(values: []const f32) f32 {
@@ -570,39 +647,87 @@ fn matmulWithTransposedB(out: *Tensor, a: *const Tensor, b_transposed: *const Te
 
     for (0..m) |row| {
         const a_row = a.data[row * k ..][0..k];
-        for (0..n) |col| {
+        const out_row = out.data[row * n ..][0..n];
+
+        var col: usize = 0;
+        while (col + 4 <= n) : (col += 4) {
+            const sums = dot4Unchecked(
+                a_row,
+                b_transposed.data[(col + 0) * k ..][0..k],
+                b_transposed.data[(col + 1) * k ..][0..k],
+                b_transposed.data[(col + 2) * k ..][0..k],
+                b_transposed.data[(col + 3) * k ..][0..k],
+            );
+            out_row[col + 0] = sums[0];
+            out_row[col + 1] = sums[1];
+            out_row[col + 2] = sums[2];
+            out_row[col + 3] = sums[3];
+        }
+        if (col + 2 <= n) {
+            const sums = dot2Unchecked(
+                a_row,
+                b_transposed.data[(col + 0) * k ..][0..k],
+                b_transposed.data[(col + 1) * k ..][0..k],
+            );
+            out_row[col + 0] = sums[0];
+            out_row[col + 1] = sums[1];
+            col += 2;
+        }
+        while (col < n) : (col += 1) {
             const bt_row = b_transposed.data[col * k ..][0..k];
-            out.data[row * n + col] = dotUnchecked(a_row, bt_row);
+            out_row[col] = dotUnchecked(a_row, bt_row);
         }
     }
 }
 
 fn matmulBlocked(out: *Tensor, a: *const Tensor, b: *const Tensor) void {
-    const tile = 32;
     const m = a.shape.dims_buf[0];
     const k = a.shape.dims_buf[1];
     const n = b.shape.dims_buf[1];
+    const vec_cols = simd_lanes;
+    const panel_cols = vec_cols * matmul_col_unroll;
 
-    @memset(out.data, 0.0);
+    for (0..m) |row| {
+        const a_row = a.data[row * k ..][0..k];
+        const out_row = out.data[row * n ..][0..n];
 
-    var ii: usize = 0;
-    while (ii < m) : (ii += tile) {
-        const i_end = @min(ii + tile, m);
-        var kk: usize = 0;
-        while (kk < k) : (kk += tile) {
-            const k_end = @min(kk + tile, k);
-            var jj: usize = 0;
-            while (jj < n) : (jj += tile) {
-                const j_end = @min(jj + tile, n);
-                for (ii..i_end) |i| {
-                    for (kk..k_end) |p| {
-                        const a_ip = a.data[i * k + p];
-                        for (jj..j_end) |j| {
-                            out.data[i * n + j] = @mulAdd(f32, a_ip, b.data[p * n + j], out.data[i * n + j]);
-                        }
-                    }
-                }
+        var col: usize = 0;
+        while (col + panel_cols <= n) : (col += panel_cols) {
+            var acc0: Vec = @splat(0.0);
+            var acc1: Vec = @splat(0.0);
+            var acc2: Vec = @splat(0.0);
+            var acc3: Vec = @splat(0.0);
+
+            for (0..k) |p| {
+                const av: Vec = @splat(a_row[p]);
+                const b_base = p * n + col;
+                acc0 += av * loadVec(b.data, b_base);
+                acc1 += av * loadVec(b.data, b_base + vec_cols);
+                acc2 += av * loadVec(b.data, b_base + vec_cols * 2);
+                acc3 += av * loadVec(b.data, b_base + vec_cols * 3);
             }
+
+            storeVec(out_row, col, acc0);
+            storeVec(out_row, col + vec_cols, acc1);
+            storeVec(out_row, col + vec_cols * 2, acc2);
+            storeVec(out_row, col + vec_cols * 3, acc3);
+        }
+
+        while (col + vec_cols <= n) : (col += vec_cols) {
+            var acc: Vec = @splat(0.0);
+            for (0..k) |p| {
+                const av: Vec = @splat(a_row[p]);
+                acc += av * loadVec(b.data, p * n + col);
+            }
+            storeVec(out_row, col, acc);
+        }
+
+        while (col < n) : (col += 1) {
+            var sum: f32 = 0.0;
+            for (0..k) |p| {
+                sum = @mulAdd(f32, a_row[p], b.data[p * n + col], sum);
+            }
+            out_row[col] = sum;
         }
     }
 }
@@ -684,6 +809,40 @@ test "matmul uses contiguous rows" {
     defer c.deinit(allocator);
 
     try std.testing.expectEqualSlices(f32, &.{ 58.0, 64.0, 139.0, 154.0 }, c.data);
+}
+
+test "matmul no-scratch and transposed scratch paths agree" {
+    const allocator = std.testing.allocator;
+    const m = 3;
+    const k = simd_lanes * 4 + 3;
+    const n = simd_lanes * matmul_col_unroll + 5;
+
+    var a = try Tensor.initUndefined(allocator, &.{ m, k });
+    defer a.deinit(allocator);
+    for (a.data, 0..) |*value, i| {
+        const pattern: i32 = @intCast(i % 11);
+        value.* = @as(f32, @floatFromInt(pattern - 5)) * 0.125;
+    }
+
+    var b = try Tensor.initUndefined(allocator, &.{ k, n });
+    defer b.deinit(allocator);
+    for (b.data, 0..) |*value, i| {
+        const pattern: i32 = @intCast((i * 3) % 13);
+        value.* = @as(f32, @floatFromInt(pattern - 6)) * 0.0625;
+    }
+
+    var no_scratch = try Tensor.matmul(allocator, &a, &b);
+    defer no_scratch.deinit(allocator);
+
+    var scratch = try Tensor.initUndefined(allocator, &.{ n, k });
+    defer scratch.deinit(allocator);
+    var with_scratch = try Tensor.initUndefined(allocator, &.{ m, n });
+    defer with_scratch.deinit(allocator);
+    try Tensor.matmulInto(&with_scratch, &a, &b, &scratch);
+
+    for (no_scratch.data, with_scratch.data) |lhs, rhs| {
+        try std.testing.expectApproxEqAbs(lhs, rhs, 1e-5);
+    }
 }
 
 test "softmax normalizes the last dimension" {

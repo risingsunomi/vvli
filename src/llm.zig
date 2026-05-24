@@ -690,7 +690,20 @@ pub const Runner = struct {
         if (position >= self.cache.max_seq_len) return Error.ContextFull;
 
         copyEmbeddingToken(self.scratch.x, self.weights.token_embedding, token_id);
+        return self.forwardCurrentEmbedding(position);
+    }
 
+    pub fn forwardEmbedding(self: *Runner, embedding: []const f32, position: usize) ![]const f32 {
+        const config = self.weights.config;
+        if (embedding.len != config.hidden_size) return Error.InvalidWeight;
+        if (position >= self.cache.max_seq_len) return Error.ContextFull;
+
+        @memcpy(self.scratch.x, embedding);
+        return self.forwardCurrentEmbedding(position);
+    }
+
+    fn forwardCurrentEmbedding(self: *Runner, position: usize) ![]const f32 {
+        const config = self.weights.config;
         for (self.weights.layers, 0..) |layer, layer_index| {
             self.prefetchAhead(layer_index);
             try self.forwardLayer(layer, layer_index, position);
@@ -1691,4 +1704,9 @@ test "runner executes a tiny qwen-shaped token step" {
     try std.testing.expectEqual(config.vocab_size, logits.len);
     for (logits) |value| try std.testing.expect(std.math.isFinite(value));
     try std.testing.expect(argmax(logits) < config.vocab_size);
+
+    var embedding: [16]f32 = @splat(0.01);
+    const embedding_logits = try runner.forwardEmbedding(&embedding, 1);
+    try std.testing.expectEqual(config.vocab_size, embedding_logits.len);
+    for (embedding_logits) |value| try std.testing.expect(std.math.isFinite(value));
 }
