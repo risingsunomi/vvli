@@ -23,3 +23,6 @@ zig-cache/
 
 # Local Hugging Face model cache. Model weights are large and have their own licenses.
 .vvli-cache/
+
+# Local vvli defaults.
+.env

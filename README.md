@@ -28,6 +28,8 @@ The default repo is currently `unsloth/Qwen2.5-0.5B-Instruct`.
 zig build -Doptimize=ReleaseFast run -- --prompt "Explain CPU inference in one paragraph."
 ```
 
+VVLI reads an optional `.env` file from the current working directory before parsing CLI flags. Copy `.env.example` to `.env` to set local defaults such as repo, cache path, prompt, generation limits, sampling settings, streaming, and download behavior. Command-line flags override `.env` values.
+
 Explicit repo and generation settings:
 
 ```sh
@@ -114,10 +116,18 @@ VVLI auto-selects a native BF16/F16/F32 text GGUF and `mmproj-F16.gguf` when pre
 - `--repeat-last-n <n>`: prompt/output token window for repeat penalty, default `64`
 - `--seed <n>`: fixed sampling seed for reproducible output
 - `--greedy`: shortcut for deterministic argmax decoding
+- `--download`: download missing files, default
 - `--no-download`: use already cached files only
 - `--stream`: stream generated text as tokens are decoded, default
 - `--no-stream`: decode and print only after generation completes
+- `--chat-template`: wrap the prompt in model chat markers, default
 - `--raw`: do not wrap the prompt in model chat markers
+
+## Environment Defaults
+
+`.env` supports `KEY=VALUE` lines, comments with `#`, optional `export`, and single- or double-quoted values. The recognized keys are:
+
+`VVLI_REPO`, `VVLI_REVISION`, `VVLI_CACHE`, `VVLI_FORMAT`, `VVLI_WEIGHTS`, `VVLI_MMPROJ`, `VVLI_PROMPT`, `VVLI_IMAGE`, `VVLI_MAX_NEW_TOKENS`, `VVLI_CTX`, `VVLI_THREADS`, `VVLI_DOWNLOAD`, `VVLI_CHAT_TEMPLATE`, `VVLI_STREAM`, `VVLI_TEMPERATURE`, `VVLI_TOP_P`, `VVLI_TOP_K`, `VVLI_REPEAT_PENALTY`, `VVLI_REPEAT_LAST_N`, `VVLI_SEED`, and `VVLI_GREEDY`.
 
 ## Model Targets
 

@@ -8,6 +8,8 @@ const tokenizer_mod = @import("tokenizer");
 const vision = @import("vision");
 const vlm = @import("vlm");
 
+const default_env_path = ".env";
+
 const ModelFormat = enum {
     auto,
     safetensors,
@@ -63,7 +65,14 @@ fn run(init: std.process.Init) !void {
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    const cli = parseArgs(args) catch {
+    if (argsRequestHelp(args)) {
+        try writeUsage(stdout);
+        try stdout.flush();
+        return;
+    }
+
+    var cli = try loadCliDefaultsFromDotEnv(arena, io);
+    cli = parseArgsWithDefaults(args, cli) catch {
         try writeUsage(stdout);
         try stdout.flush();
         return;
@@ -444,6 +453,7 @@ fn writeAppError(io: std.Io, err: anyerror) !void {
         error.InvalidImageFile => try stderr.writeAll("vvli: image file extension and file header do not match a supported image format.\n"),
         error.NativeImageDecodeUnsupported => try stderr.writeAll("vvli: native image decode/resize currently uses ImageIO on macOS. Non-Apple image decoders are planned.\n"),
         error.EmptyImageFile => try stderr.writeAll("vvli: image file is empty.\n"),
+        error.InvalidEnv => try stderr.writeAll("vvli: invalid .env. Expected KEY=VALUE lines with VVLI_* keys; see .env.example.\n"),
         error.UnsupportedDType => try stderr.writeAll("vvli: unsupported tensor dtype. Native BF16/F16/F32 GGUF tensors are supported first; quantized GGUF tensors still need dequant kernels.\n"),
         error.UnsupportedProjectorDType => try stderr.writeAll("vvli: unsupported projector dtype. The native VLM path currently requires BF16/F16/F32 mmproj tensors.\n"),
         error.UnsupportedModelArchitecture => try stderr.writeAll("vvli: this model architecture is not implemented in the CPU runner yet.\n"),
@@ -599,9 +609,177 @@ fn remoteConfigHasMoeFields(allocator: std.mem.Allocator, io: std.Io, repo: hf_d
     return false;
 }
 
-fn parseArgs(args: []const []const u8) !Cli {
+fn loadCliDefaultsFromDotEnv(allocator: std.mem.Allocator, io: std.Io) !Cli {
     var cli: Cli = .{};
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, default_env_path, allocator, .limited(64 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return cli,
+        else => return err,
+    };
+    try applyDotEnvDefaults(&cli, bytes);
+    return cli;
+}
+
+fn applyDotEnvDefaults(cli: *Cli, bytes: []const u8) !void {
+    var rest = bytes;
+    while (rest.len > 0) {
+        const newline = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const raw_line = rest[0..newline];
+        rest = if (newline == rest.len) rest[rest.len..] else rest[newline + 1 ..];
+
+        var line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (std.mem.startsWith(u8, line, "export ")) {
+            line = std.mem.trim(u8, line["export ".len..], " \t\r\n");
+        }
+
+        const separator = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidEnv;
+        const key = std.mem.trim(u8, line[0..separator], " \t");
+        const value = try parseDotEnvValue(line[separator + 1 ..]);
+        if (key.len == 0) return error.InvalidEnv;
+        try applyDotEnvDefault(cli, key, value);
+    }
+}
+
+fn parseDotEnvValue(raw: []const u8) ![]const u8 {
+    const value = trimDotEnvLeft(raw);
+    if (value.len == 0) return "";
+
+    if (value[0] == '"' or value[0] == '\'') {
+        const quote = value[0];
+        var escaped = false;
+        var i: usize = 1;
+        while (i < value.len) : (i += 1) {
+            const byte = value[i];
+            if (quote == '"' and byte == '\\' and !escaped) {
+                escaped = true;
+                continue;
+            }
+            if (byte == quote and !escaped) {
+                const trailing = std.mem.trim(u8, value[i + 1 ..], " \t\r\n");
+                if (trailing.len != 0 and trailing[0] != '#') return error.InvalidEnv;
+                return value[1..i];
+            }
+            escaped = false;
+        }
+        return error.InvalidEnv;
+    }
+
+    return std.mem.trim(u8, stripDotEnvComment(value), " \t\r\n");
+}
+
+fn trimDotEnvLeft(value: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < value.len and (value[start] == ' ' or value[start] == '\t')) : (start += 1) {}
+    return value[start..];
+}
+
+fn stripDotEnvComment(value: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        if (value[i] == '#' and (i == 0 or isDotEnvSpace(value[i - 1]))) return value[0..i];
+    }
+    return value;
+}
+
+fn isDotEnvSpace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
+}
+
+fn applyDotEnvDefault(cli: *Cli, key: []const u8, value: []const u8) !void {
+    if (value.len == 0) return;
+
+    if (std.mem.eql(u8, key, "VVLI_REPO")) {
+        cli.repo_id = value;
+    } else if (std.mem.eql(u8, key, "VVLI_REVISION")) {
+        cli.revision = value;
+    } else if (std.mem.eql(u8, key, "VVLI_CACHE")) {
+        cli.cache_root = value;
+    } else if (std.mem.eql(u8, key, "VVLI_WEIGHTS")) {
+        cli.weights_file = value;
+    } else if (std.mem.eql(u8, key, "VVLI_MMPROJ")) {
+        cli.mmproj_file = value;
+    } else if (std.mem.eql(u8, key, "VVLI_FORMAT")) {
+        cli.format = parseFormat(value) orelse return error.InvalidEnv;
+    } else if (std.mem.eql(u8, key, "VVLI_PROMPT")) {
+        cli.prompt = value;
+    } else if (std.mem.eql(u8, key, "VVLI_IMAGE")) {
+        cli.image_path = value;
+    } else if (std.mem.eql(u8, key, "VVLI_MAX_NEW_TOKENS")) {
+        cli.max_new_tokens = try parseEnvInt(usize, value);
+    } else if (std.mem.eql(u8, key, "VVLI_CTX")) {
+        cli.context = try parseEnvInt(usize, value);
+    } else if (std.mem.eql(u8, key, "VVLI_THREADS")) {
+        cli.threads = try parseEnvInt(usize, value);
+    } else if (std.mem.eql(u8, key, "VVLI_DOWNLOAD")) {
+        cli.download = try parseEnvBool(value);
+    } else if (std.mem.eql(u8, key, "VVLI_CHAT_TEMPLATE")) {
+        cli.chat_template = try parseEnvBool(value);
+    } else if (std.mem.eql(u8, key, "VVLI_STREAM")) {
+        cli.stream = try parseEnvBool(value);
+    } else if (std.mem.eql(u8, key, "VVLI_TEMPERATURE")) {
+        cli.temperature = try parseEnvFloat(f32, value);
+    } else if (std.mem.eql(u8, key, "VVLI_TOP_P")) {
+        cli.top_p = try parseEnvFloat(f32, value);
+    } else if (std.mem.eql(u8, key, "VVLI_TOP_K")) {
+        cli.top_k = try parseEnvInt(usize, value);
+    } else if (std.mem.eql(u8, key, "VVLI_REPEAT_PENALTY")) {
+        cli.repeat_penalty = try parseEnvFloat(f32, value);
+    } else if (std.mem.eql(u8, key, "VVLI_REPEAT_LAST_N")) {
+        cli.repeat_last_n = try parseEnvInt(usize, value);
+    } else if (std.mem.eql(u8, key, "VVLI_SEED")) {
+        cli.seed = try parseEnvInt(u64, value);
+    } else if (std.mem.eql(u8, key, "VVLI_GREEDY")) {
+        if (try parseEnvBool(value)) {
+            cli.temperature = 0.0;
+            cli.top_p = 1.0;
+            cli.top_k = 1;
+            cli.repeat_penalty = 1.0;
+        }
+    }
+}
+
+fn parseEnvInt(comptime T: type, value: []const u8) !T {
+    return std.fmt.parseInt(T, value, 10) catch return error.InvalidEnv;
+}
+
+fn parseEnvFloat(comptime T: type, value: []const u8) !T {
+    return std.fmt.parseFloat(T, value) catch return error.InvalidEnv;
+}
+
+fn parseEnvBool(value: []const u8) !bool {
+    if (std.ascii.eqlIgnoreCase(value, "true") or
+        std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on"))
+    {
+        return true;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "false") or
+        std.mem.eql(u8, value, "0") or
+        std.ascii.eqlIgnoreCase(value, "no") or
+        std.ascii.eqlIgnoreCase(value, "off"))
+    {
+        return false;
+    }
+    return error.InvalidEnv;
+}
+
+fn parseArgs(args: []const []const u8) !Cli {
+    return parseArgsWithDefaults(args, .{});
+}
+
+fn argsRequestHelp(args: []const []const u8) bool {
+    if (args.len <= 1) return false;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+    }
+    return false;
+}
+
+fn parseArgsWithDefaults(args: []const []const u8, defaults: Cli) !Cli {
+    var cli = defaults;
     var i: usize = 1;
+    var prompt_set_by_args = false;
 
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -634,6 +812,7 @@ fn parseArgs(args: []const []const u8) !Cli {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
             cli.prompt = args[i];
+            prompt_set_by_args = true;
         } else if (std.mem.eql(u8, arg, "--image")) {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
@@ -679,18 +858,23 @@ fn parseArgs(args: []const []const u8) !Cli {
             cli.top_p = 1.0;
             cli.top_k = 1;
             cli.repeat_penalty = 1.0;
+        } else if (std.mem.eql(u8, arg, "--download")) {
+            cli.download = true;
         } else if (std.mem.eql(u8, arg, "--no-download")) {
             cli.download = false;
         } else if (std.mem.eql(u8, arg, "--stream")) {
             cli.stream = true;
         } else if (std.mem.eql(u8, arg, "--no-stream")) {
             cli.stream = false;
+        } else if (std.mem.eql(u8, arg, "--chat-template")) {
+            cli.chat_template = true;
         } else if (std.mem.eql(u8, arg, "--raw")) {
             cli.chat_template = false;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.InvalidArgs;
-        } else if (cli.prompt == null) {
+        } else if (!prompt_set_by_args) {
             cli.prompt = arg;
+            prompt_set_by_args = true;
         } else {
             return error.InvalidArgs;
         }
@@ -736,6 +920,8 @@ fn writeUsage(writer: *std.Io.Writer) !void {
         \\  zig build run -- --repo unsloth/Llama-3.2-1B-Instruct-GGUF --prompt "hello"
         \\  zig build run -- --repo unsloth/Qwen3.5-9B-GGUF --weights Qwen3.5-9B-Q4_0.gguf --mmproj mmproj-F16.gguf --image ./image.jpg --prompt "Describe this image."
         \\
+        \\vvli also reads default values from .env when present. Command-line flags override .env.
+        \\
         \\options:
         \\  --repo <id>              Hugging Face repo id. Default: unsloth/Qwen2.5-0.5B-Instruct
         \\  --revision <rev>         Hugging Face revision. Default: main
@@ -755,9 +941,11 @@ fn writeUsage(writer: *std.Io.Writer) !void {
         \\  --repeat-last-n <n>      Recent prompt/output window for repeat penalty. Default: 64
         \\  --seed <n>               Fixed sampling seed
         \\  --greedy                 Shortcut for temperature 0, top-p 1, top-k 1, repeat penalty 1
+        \\  --download               Download missing files. Default
         \\  --no-download            Use the cache only
         \\  --stream                 Stream generated text as tokens are decoded. Default
         \\  --no-stream              Decode and print only after generation completes
+        \\  --chat-template          Wrap prompt in model chat markers. Default
         \\  --raw                    Do not wrap prompt in model chat markers
         \\
     );
@@ -832,4 +1020,88 @@ test "parses sampling options" {
     try std.testing.expectEqual(@as(f32, 1.0), greedy.top_p);
     try std.testing.expectEqual(@as(usize, 1), greedy.top_k);
     try std.testing.expectEqual(@as(f32, 1.0), greedy.repeat_penalty);
+}
+
+test "parses dotenv defaults" {
+    var cli: Cli = .{};
+    try applyDotEnvDefaults(&cli,
+        \\# comments and blank lines are ignored
+        \\VVLI_REPO=org/model
+        \\VVLI_REVISION="feature branch"
+        \\VVLI_CACHE=.cache/vvli
+        \\VVLI_FORMAT=gguf
+        \\VVLI_WEIGHTS=model-BF16.gguf
+        \\VVLI_MMPROJ='mmproj-F16.gguf'
+        \\VVLI_PROMPT=hello from dotenv # trailing comment
+        \\VVLI_IMAGE=frame.png
+        \\VVLI_MAX_NEW_TOKENS=12
+        \\VVLI_CTX=256
+        \\VVLI_THREADS=2
+        \\VVLI_DOWNLOAD=false
+        \\VVLI_CHAT_TEMPLATE=false
+        \\VVLI_STREAM=no
+        \\VVLI_TEMPERATURE=0.4
+        \\VVLI_TOP_P=0.8
+        \\VVLI_TOP_K=7
+        \\VVLI_REPEAT_PENALTY=1.2
+        \\VVLI_REPEAT_LAST_N=16
+        \\VVLI_SEED=42
+        \\IGNORED_KEY=ignored
+    );
+
+    try std.testing.expectEqualStrings("org/model", cli.repo_id);
+    try std.testing.expectEqualStrings("feature branch", cli.revision);
+    try std.testing.expectEqualStrings(".cache/vvli", cli.cache_root);
+    try std.testing.expectEqual(ModelFormat.gguf, cli.format);
+    try std.testing.expectEqualStrings("model-BF16.gguf", cli.weights_file.?);
+    try std.testing.expectEqualStrings("mmproj-F16.gguf", cli.mmproj_file.?);
+    try std.testing.expectEqualStrings("hello from dotenv", cli.prompt.?);
+    try std.testing.expectEqualStrings("frame.png", cli.image_path.?);
+    try std.testing.expectEqual(@as(usize, 12), cli.max_new_tokens);
+    try std.testing.expectEqual(@as(usize, 256), cli.context);
+    try std.testing.expectEqual(@as(usize, 2), cli.threads);
+    try std.testing.expect(!cli.download);
+    try std.testing.expect(!cli.chat_template);
+    try std.testing.expect(!cli.stream);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), cli.temperature, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), cli.top_p, 1e-6);
+    try std.testing.expectEqual(@as(usize, 7), cli.top_k);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.2), cli.repeat_penalty, 1e-6);
+    try std.testing.expectEqual(@as(usize, 16), cli.repeat_last_n);
+    try std.testing.expectEqual(@as(u64, 42), cli.seed.?);
+}
+
+test "cli args override dotenv defaults" {
+    var defaults: Cli = .{};
+    try applyDotEnvDefaults(&defaults,
+        \\VVLI_REPO=org/env-model
+        \\VVLI_PROMPT=env prompt
+        \\VVLI_TOP_K=5
+        \\VVLI_STREAM=false
+        \\VVLI_DOWNLOAD=false
+        \\VVLI_CHAT_TEMPLATE=false
+    );
+
+    const cli = try parseArgsWithDefaults(&.{
+        "vvli",
+        "--repo",
+        "org/cli-model",
+        "--prompt",
+        "cli prompt",
+        "--top-k",
+        "11",
+        "--stream",
+        "--download",
+        "--chat-template",
+    }, defaults);
+
+    try std.testing.expectEqualStrings("org/cli-model", cli.repo_id);
+    try std.testing.expectEqualStrings("cli prompt", cli.prompt.?);
+    try std.testing.expectEqual(@as(usize, 11), cli.top_k);
+    try std.testing.expect(cli.stream);
+    try std.testing.expect(cli.download);
+    try std.testing.expect(cli.chat_template);
+
+    const positional_prompt = try parseArgsWithDefaults(&.{ "vvli", "positional prompt" }, defaults);
+    try std.testing.expectEqualStrings("positional prompt", positional_prompt.prompt.?);
 }
