@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 const std = @import("std");
+const DotEnv = @import("dotenv");
 const generator = @import("generator");
 const hf_downloader = @import("hf_downloader");
 const llm = @import("llm");
@@ -71,7 +72,7 @@ fn run(init: std.process.Init) !void {
         return;
     }
 
-    var cli = try loadCliDefaultsFromDotEnv(arena, io);
+    var cli = try loadCliDefaultsFromDotEnv(arena, io, init.environ_map);
     cli = parseArgsWithDefaults(args, cli) catch {
         try writeUsage(stdout);
         try stdout.flush();
@@ -459,7 +460,7 @@ fn writeAppError(io: std.Io, err: anyerror) !void {
         error.UnsupportedModelArchitecture => try stderr.writeAll("vvli: this model architecture is not implemented in the CPU runner yet.\n"),
         error.InvalidSamplingOptions => try stderr.writeAll("vvli: invalid sampling options. Use temperature >= 0, 0 < top-p <= 1, and repeat-penalty >= 1.\n"),
         error.DownloadFailed => try stderr.writeAll("vvli: download failed. Check the repo, revision, selected --format, and --weights file name.\n"),
-        else => {},
+        else => try stderr.print("vvli: {s}\n", .{@errorName(err)}),
     }
 
     try stderr.flush();
@@ -609,159 +610,91 @@ fn remoteConfigHasMoeFields(allocator: std.mem.Allocator, io: std.Io, repo: hf_d
     return false;
 }
 
-fn loadCliDefaultsFromDotEnv(allocator: std.mem.Allocator, io: std.Io) !Cli {
+fn loadCliDefaultsFromDotEnv(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: ?*const std.process.Environ.Map,
+) !Cli {
+    return loadCliDefaultsFromDotEnvPath(allocator, io, default_env_path, environ_map);
+}
+
+fn loadCliDefaultsFromDotEnvPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+) !Cli {
     var cli: Cli = .{};
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, default_env_path, allocator, .limited(64 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return cli,
-        else => return err,
-    };
-    try applyDotEnvDefaults(&cli, bytes);
+    var env: DotEnv = DotEnv.initWithPathIo(allocator, io, path, 64 * 1024, environ_map) catch |err| return mapDotEnvError(err);
+    defer env.deinit();
+
+    try applyDotEnvDefaults(&cli, allocator, &env);
     return cli;
 }
 
-fn applyDotEnvDefaults(cli: *Cli, bytes: []const u8) !void {
-    var rest = bytes;
-    while (rest.len > 0) {
-        const newline = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-        const raw_line = rest[0..newline];
-        rest = if (newline == rest.len) rest[rest.len..] else rest[newline + 1 ..];
+fn loadCliDefaultsFromDotEnvContent(allocator: std.mem.Allocator, content: []const u8) !Cli {
+    var cli: Cli = .{};
+    var env: DotEnv = DotEnv.init(allocator, content) catch |err| return mapDotEnvError(err);
+    defer env.deinit();
 
-        var line = std.mem.trim(u8, raw_line, " \t\r\n");
-        if (line.len == 0 or line[0] == '#') continue;
-        if (std.mem.startsWith(u8, line, "export ")) {
-            line = std.mem.trim(u8, line["export ".len..], " \t\r\n");
-        }
+    try applyDotEnvDefaults(&cli, allocator, &env);
+    return cli;
+}
 
-        const separator = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidEnv;
-        const key = std.mem.trim(u8, line[0..separator], " \t");
-        const value = try parseDotEnvValue(line[separator + 1 ..]);
-        if (key.len == 0) return error.InvalidEnv;
-        try applyDotEnvDefault(cli, key, value);
+fn applyDotEnvDefaults(cli: *Cli, allocator: std.mem.Allocator, env: *DotEnv) !void {
+    if (env.get("VVLI_REPO")) |value| cli.repo_id = try allocator.dupe(u8, value);
+    if (env.get("VVLI_REVISION")) |value| cli.revision = try allocator.dupe(u8, value);
+    if (env.get("VVLI_CACHE")) |value| cli.cache_root = try allocator.dupe(u8, value);
+    if (env.get("VVLI_WEIGHTS")) |value| cli.weights_file = try allocator.dupe(u8, value);
+    if (env.get("VVLI_MMPROJ")) |value| cli.mmproj_file = try allocator.dupe(u8, value);
+    if (env.get("VVLI_FORMAT")) |value| cli.format = parseFormat(value) orelse return error.InvalidEnv;
+    if (env.get("VVLI_PROMPT")) |value| cli.prompt = try allocator.dupe(u8, value);
+    if (env.get("VVLI_IMAGE")) |value| cli.image_path = try allocator.dupe(u8, value);
+    if (env.get("VVLI_MAX_NEW_TOKENS") != null) cli.max_new_tokens = try envParseUsize(env, "VVLI_MAX_NEW_TOKENS");
+    if (env.get("VVLI_CTX") != null) cli.context = try envParseUsize(env, "VVLI_CTX");
+    if (env.get("VVLI_THREADS") != null) cli.threads = try envParseUsize(env, "VVLI_THREADS");
+    if (env.get("VVLI_DOWNLOAD") != null) cli.download = try envParseBool(env, "VVLI_DOWNLOAD");
+    if (env.get("VVLI_CHAT_TEMPLATE") != null) cli.chat_template = try envParseBool(env, "VVLI_CHAT_TEMPLATE");
+    if (env.get("VVLI_STREAM") != null) cli.stream = try envParseBool(env, "VVLI_STREAM");
+    if (env.get("VVLI_TEMPERATURE") != null) cli.temperature = try envParseFloat(env, "VVLI_TEMPERATURE");
+    if (env.get("VVLI_TOP_P") != null) cli.top_p = try envParseFloat(env, "VVLI_TOP_P");
+    if (env.get("VVLI_TOP_K") != null) cli.top_k = try envParseUsize(env, "VVLI_TOP_K");
+    if (env.get("VVLI_REPEAT_PENALTY") != null) cli.repeat_penalty = try envParseFloat(env, "VVLI_REPEAT_PENALTY");
+    if (env.get("VVLI_REPEAT_LAST_N") != null) cli.repeat_last_n = try envParseUsize(env, "VVLI_REPEAT_LAST_N");
+    if (env.get("VVLI_SEED") != null) cli.seed = try envParseU64(env, "VVLI_SEED");
+    if (env.get("VVLI_GREEDY") != null and try envParseBool(env, "VVLI_GREEDY")) {
+        cli.temperature = 0.0;
+        cli.top_p = 1.0;
+        cli.top_k = 1;
+        cli.repeat_penalty = 1.0;
     }
 }
 
-fn parseDotEnvValue(raw: []const u8) ![]const u8 {
-    const value = trimDotEnvLeft(raw);
-    if (value.len == 0) return "";
-
-    if (value[0] == '"' or value[0] == '\'') {
-        const quote = value[0];
-        var escaped = false;
-        var i: usize = 1;
-        while (i < value.len) : (i += 1) {
-            const byte = value[i];
-            if (quote == '"' and byte == '\\' and !escaped) {
-                escaped = true;
-                continue;
-            }
-            if (byte == quote and !escaped) {
-                const trailing = std.mem.trim(u8, value[i + 1 ..], " \t\r\n");
-                if (trailing.len != 0 and trailing[0] != '#') return error.InvalidEnv;
-                return value[1..i];
-            }
-            escaped = false;
-        }
-        return error.InvalidEnv;
-    }
-
-    return std.mem.trim(u8, stripDotEnvComment(value), " \t\r\n");
+fn envParseUsize(env: *DotEnv, key: []const u8) !usize {
+    return env.parseUsize(key) catch |err| return mapDotEnvError(err);
 }
 
-fn trimDotEnvLeft(value: []const u8) []const u8 {
-    var start: usize = 0;
-    while (start < value.len and (value[start] == ' ' or value[start] == '\t')) : (start += 1) {}
-    return value[start..];
+fn envParseU64(env: *DotEnv, key: []const u8) !u64 {
+    return env.parseU64(key) catch |err| return mapDotEnvError(err);
 }
 
-fn stripDotEnvComment(value: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < value.len) : (i += 1) {
-        if (value[i] == '#' and (i == 0 or isDotEnvSpace(value[i - 1]))) return value[0..i];
-    }
-    return value;
+fn envParseFloat(env: *DotEnv, key: []const u8) !f32 {
+    return env.parseFloat(key) catch |err| return mapDotEnvError(err);
 }
 
-fn isDotEnvSpace(byte: u8) bool {
-    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
+fn envParseBool(env: *DotEnv, key: []const u8) !bool {
+    return env.parseBool(key) catch |err| return mapDotEnvError(err);
 }
 
-fn applyDotEnvDefault(cli: *Cli, key: []const u8, value: []const u8) !void {
-    if (value.len == 0) return;
-
-    if (std.mem.eql(u8, key, "VVLI_REPO")) {
-        cli.repo_id = value;
-    } else if (std.mem.eql(u8, key, "VVLI_REVISION")) {
-        cli.revision = value;
-    } else if (std.mem.eql(u8, key, "VVLI_CACHE")) {
-        cli.cache_root = value;
-    } else if (std.mem.eql(u8, key, "VVLI_WEIGHTS")) {
-        cli.weights_file = value;
-    } else if (std.mem.eql(u8, key, "VVLI_MMPROJ")) {
-        cli.mmproj_file = value;
-    } else if (std.mem.eql(u8, key, "VVLI_FORMAT")) {
-        cli.format = parseFormat(value) orelse return error.InvalidEnv;
-    } else if (std.mem.eql(u8, key, "VVLI_PROMPT")) {
-        cli.prompt = value;
-    } else if (std.mem.eql(u8, key, "VVLI_IMAGE")) {
-        cli.image_path = value;
-    } else if (std.mem.eql(u8, key, "VVLI_MAX_NEW_TOKENS")) {
-        cli.max_new_tokens = try parseEnvInt(usize, value);
-    } else if (std.mem.eql(u8, key, "VVLI_CTX")) {
-        cli.context = try parseEnvInt(usize, value);
-    } else if (std.mem.eql(u8, key, "VVLI_THREADS")) {
-        cli.threads = try parseEnvInt(usize, value);
-    } else if (std.mem.eql(u8, key, "VVLI_DOWNLOAD")) {
-        cli.download = try parseEnvBool(value);
-    } else if (std.mem.eql(u8, key, "VVLI_CHAT_TEMPLATE")) {
-        cli.chat_template = try parseEnvBool(value);
-    } else if (std.mem.eql(u8, key, "VVLI_STREAM")) {
-        cli.stream = try parseEnvBool(value);
-    } else if (std.mem.eql(u8, key, "VVLI_TEMPERATURE")) {
-        cli.temperature = try parseEnvFloat(f32, value);
-    } else if (std.mem.eql(u8, key, "VVLI_TOP_P")) {
-        cli.top_p = try parseEnvFloat(f32, value);
-    } else if (std.mem.eql(u8, key, "VVLI_TOP_K")) {
-        cli.top_k = try parseEnvInt(usize, value);
-    } else if (std.mem.eql(u8, key, "VVLI_REPEAT_PENALTY")) {
-        cli.repeat_penalty = try parseEnvFloat(f32, value);
-    } else if (std.mem.eql(u8, key, "VVLI_REPEAT_LAST_N")) {
-        cli.repeat_last_n = try parseEnvInt(usize, value);
-    } else if (std.mem.eql(u8, key, "VVLI_SEED")) {
-        cli.seed = try parseEnvInt(u64, value);
-    } else if (std.mem.eql(u8, key, "VVLI_GREEDY")) {
-        if (try parseEnvBool(value)) {
-            cli.temperature = 0.0;
-            cli.top_p = 1.0;
-            cli.top_k = 1;
-            cli.repeat_penalty = 1.0;
-        }
-    }
-}
-
-fn parseEnvInt(comptime T: type, value: []const u8) !T {
-    return std.fmt.parseInt(T, value, 10) catch return error.InvalidEnv;
-}
-
-fn parseEnvFloat(comptime T: type, value: []const u8) !T {
-    return std.fmt.parseFloat(T, value) catch return error.InvalidEnv;
-}
-
-fn parseEnvBool(value: []const u8) !bool {
-    if (std.ascii.eqlIgnoreCase(value, "true") or
-        std.mem.eql(u8, value, "1") or
-        std.ascii.eqlIgnoreCase(value, "yes") or
-        std.ascii.eqlIgnoreCase(value, "on"))
-    {
-        return true;
-    }
-    if (std.ascii.eqlIgnoreCase(value, "false") or
-        std.mem.eql(u8, value, "0") or
-        std.ascii.eqlIgnoreCase(value, "no") or
-        std.ascii.eqlIgnoreCase(value, "off"))
-    {
-        return false;
-    }
-    return error.InvalidEnv;
+fn mapDotEnvError(err: anyerror) anyerror {
+    return switch (err) {
+        error.ValueMalformed,
+        error.InvalidEnvVar,
+        error.MissingRequiredEnvVar,
+        error.StreamTooLong,
+        => error.InvalidEnv,
+        else => err,
+    };
 }
 
 fn parseArgs(args: []const []const u8) !Cli {
@@ -903,6 +836,7 @@ fn renderChatPrompt(allocator: std.mem.Allocator, architecture: llm.Architecture
             "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{s}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
             .{prompt},
         ),
+        .mistral => std.fmt.allocPrint(allocator, "<s>[INST] {s} [/INST]", .{prompt}),
         .qwen2 => std.fmt.allocPrint(
             allocator,
             "<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n",
@@ -965,6 +899,13 @@ test "renders llama chat prompt" {
     try std.testing.expectEqualStrings("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n", rendered);
 }
 
+test "renders mistral chat prompt" {
+    const allocator = std.testing.allocator;
+    const rendered = try renderChatPrompt(allocator, .mistral, "hi");
+    defer allocator.free(rendered);
+    try std.testing.expectEqualStrings("<s>[INST] hi [/INST]", rendered);
+}
+
 test "auto format detects gguf repos and files" {
     const cli_by_repo: Cli = .{ .repo_id = "unsloth/Llama-3.2-1B-Instruct-GGUF" };
     try std.testing.expectEqual(ModelFormat.gguf, cli_by_repo.resolveFormat());
@@ -1023,8 +964,10 @@ test "parses sampling options" {
 }
 
 test "parses dotenv defaults" {
-    var cli: Cli = .{};
-    try applyDotEnvDefaults(&cli,
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const cli = try loadCliDefaultsFromDotEnvContent(arena.allocator(),
         \\# comments and blank lines are ignored
         \\VVLI_REPO=org/model
         \\VVLI_REVISION="feature branch"
@@ -1032,14 +975,14 @@ test "parses dotenv defaults" {
         \\VVLI_FORMAT=gguf
         \\VVLI_WEIGHTS=model-BF16.gguf
         \\VVLI_MMPROJ='mmproj-F16.gguf'
-        \\VVLI_PROMPT=hello from dotenv # trailing comment
+        \\VVLI_PROMPT=hello from dotenv
         \\VVLI_IMAGE=frame.png
         \\VVLI_MAX_NEW_TOKENS=12
         \\VVLI_CTX=256
         \\VVLI_THREADS=2
         \\VVLI_DOWNLOAD=false
         \\VVLI_CHAT_TEMPLATE=false
-        \\VVLI_STREAM=no
+        \\VVLI_STREAM=false
         \\VVLI_TEMPERATURE=0.4
         \\VVLI_TOP_P=0.8
         \\VVLI_TOP_K=7
@@ -1071,9 +1014,53 @@ test "parses dotenv defaults" {
     try std.testing.expectEqual(@as(u64, 42), cli.seed.?);
 }
 
+test "loads dotenv defaults from .env file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = default_env_path,
+        .data =
+        \\VVLI_REPO=org/file-model
+        \\VVLI_MAX_NEW_TOKENS=800
+        \\VVLI_CTX=51
+        \\VVLI_STREAM=false
+        ,
+    });
+
+    const env_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ &tmp.sub_path, default_env_path });
+    const cli = try loadCliDefaultsFromDotEnvPath(allocator, std.testing.io, env_path, null);
+    try std.testing.expectEqualStrings("org/file-model", cli.repo_id);
+    try std.testing.expectEqual(@as(usize, 800), cli.max_new_tokens);
+    try std.testing.expectEqual(@as(usize, 51), cli.context);
+    try std.testing.expect(!cli.stream);
+}
+
+test "loads dotenv defaults from process environment map" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    try env_map.put("VVLI_REPO", "org/process-model");
+    try env_map.put("VVLI_TOP_K", "9");
+    try env_map.put("VVLI_STREAM", "false");
+
+    const cli = try loadCliDefaultsFromDotEnvPath(allocator, std.testing.io, ".zig-cache/tmp/missing-vvli-env-file", &env_map);
+    try std.testing.expectEqualStrings("org/process-model", cli.repo_id);
+    try std.testing.expectEqual(@as(usize, 9), cli.top_k);
+    try std.testing.expect(!cli.stream);
+}
+
 test "cli args override dotenv defaults" {
-    var defaults: Cli = .{};
-    try applyDotEnvDefaults(&defaults,
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const defaults = try loadCliDefaultsFromDotEnvContent(arena.allocator(),
         \\VVLI_REPO=org/env-model
         \\VVLI_PROMPT=env prompt
         \\VVLI_TOP_K=5

@@ -16,12 +16,18 @@ const TokenEntry = struct {
     special: bool,
 };
 
+const Encoding = enum {
+    byte_level,
+    metaspace_byte_fallback,
+};
+
 pub const Tokenizer = struct {
     allocator: Allocator,
     token_to_id: std.StringHashMap(u32),
     merge_ranks: std.StringHashMap(u32),
     id_to_token: []?[]u8,
     special_token: []bool,
+    encoding: Encoding = .byte_level,
     eos_token_id: ?u32 = null,
     pad_token_id: ?u32 = null,
 
@@ -85,6 +91,7 @@ pub const Tokenizer = struct {
             .merge_ranks = std.StringHashMap(u32).init(allocator),
             .id_to_token = try allocator.alloc(?[]u8, max_id + 1),
             .special_token = try allocator.alloc(bool, max_id + 1),
+            .encoding = detectEncoding(parsed.value.object),
         };
         errdefer tokenizer.deinit();
         @memset(tokenizer.id_to_token, null);
@@ -108,7 +115,10 @@ pub const Tokenizer = struct {
                     const id: u32 = @intCast(try jsonUsize(id_value));
                     const special = getBool(item.object, "special") orelse false;
                     try tokenizer.addToken(content, id, special);
-                    if (std.mem.eql(u8, content, "<|endoftext|>") or std.mem.eql(u8, content, "<|im_end|>")) {
+                    if (std.mem.eql(u8, content, "<|endoftext|>") or
+                        std.mem.eql(u8, content, "<|im_end|>") or
+                        std.mem.eql(u8, content, "</s>"))
+                    {
                         tokenizer.eos_token_id = id;
                     }
                 }
@@ -206,8 +216,11 @@ pub const Tokenizer = struct {
         const entry = try self.tokenEntry(id);
         if (entry.special) {
             try writer.writeAll(entry.token);
-        } else {
-            try writeByteLevelDecoded(writer, entry.token);
+            return;
+        }
+        switch (self.encoding) {
+            .byte_level => try writeByteLevelDecoded(writer, entry.token),
+            .metaspace_byte_fallback => try writeMetaspaceByteFallbackDecoded(writer, entry.token),
         }
     }
 
@@ -228,8 +241,11 @@ pub const Tokenizer = struct {
         const entry = try self.tokenEntry(id);
         if (entry.special) {
             try out.appendSlice(entry.token);
-        } else {
-            try appendByteLevelDecoded(out, entry.token);
+            return;
+        }
+        switch (self.encoding) {
+            .byte_level => try appendByteLevelDecoded(out, entry.token),
+            .metaspace_byte_fallback => try appendMetaspaceByteFallbackDecoded(out, entry.token),
         }
     }
 
@@ -290,10 +306,9 @@ pub const Tokenizer = struct {
         const scratch = arena.allocator();
 
         var symbols = std.array_list.Managed([]const u8).init(scratch);
-        for (chunk) |byte| {
-            var buf: [4]u8 = undefined;
-            const len = try std.unicode.utf8Encode(byteToUnicode(byte), &buf);
-            try symbols.append(try scratch.dupe(u8, buf[0..len]));
+        switch (self.encoding) {
+            .byte_level => try appendByteLevelSymbols(scratch, &symbols, chunk),
+            .metaspace_byte_fallback => try appendMetaspaceByteFallbackSymbols(scratch, &symbols, chunk),
         }
 
         while (symbols.items.len > 1) {
@@ -317,7 +332,21 @@ pub const Tokenizer = struct {
         }
 
         for (symbols.items) |symbol| {
-            const id = self.token_to_id.get(symbol) orelse return Error.UnknownToken;
+            if (self.token_to_id.get(symbol)) |id| {
+                try out.append(id);
+            } else if (self.encoding == .metaspace_byte_fallback) {
+                try self.appendByteFallback(out, symbol);
+            } else {
+                return Error.UnknownToken;
+            }
+        }
+    }
+
+    fn appendByteFallback(self: *const Tokenizer, out: *std.array_list.Managed(u32), bytes: []const u8) !void {
+        var token_buf: [6]u8 = undefined;
+        for (bytes) |byte| {
+            const token = try std.fmt.bufPrint(&token_buf, "<0x{X:0>2}>", .{byte});
+            const id = self.token_to_id.get(token) orelse return Error.UnknownToken;
             try out.append(id);
         }
     }
@@ -383,6 +412,21 @@ fn getBool(object: std.json.ObjectMap, key: []const u8) ?bool {
     };
 }
 
+fn detectEncoding(root: std.json.ObjectMap) Encoding {
+    if (root.get("pre_tokenizer")) |pre_tokenizer| {
+        if (pre_tokenizer == .object) {
+            if (getString(pre_tokenizer.object, "type")) |kind| {
+                if (std.mem.eql(u8, kind, "Metaspace")) return .metaspace_byte_fallback;
+            }
+        }
+    }
+
+    const model = root.get("model") orelse return .byte_level;
+    if (model != .object) return .byte_level;
+    if (getBool(model.object, "byte_fallback") orelse false) return .metaspace_byte_fallback;
+    return .byte_level;
+}
+
 fn looksSpecial(token: []const u8) bool {
     return (token.len >= 4 and std.mem.startsWith(u8, token, "<|") and std.mem.endsWith(u8, token, "|>")) or
         std.mem.eql(u8, token, "<s>") or
@@ -413,11 +457,62 @@ fn concat(allocator: Allocator, left: []const u8, right: []const u8) ![]u8 {
     return out;
 }
 
+fn appendByteLevelSymbols(
+    allocator: Allocator,
+    symbols: *std.array_list.Managed([]const u8),
+    chunk: []const u8,
+) !void {
+    for (chunk) |byte| {
+        var buf: [4]u8 = undefined;
+        const len = try std.unicode.utf8Encode(byteToUnicode(byte), &buf);
+        try symbols.append(try allocator.dupe(u8, buf[0..len]));
+    }
+}
+
+fn appendMetaspaceByteFallbackSymbols(
+    allocator: Allocator,
+    symbols: *std.array_list.Managed([]const u8),
+    chunk: []const u8,
+) !void {
+    var transformed = std.array_list.Managed(u8).init(allocator);
+    if (chunk.len != 0 and chunk[0] != ' ') try transformed.appendSlice("▁");
+    for (chunk) |byte| {
+        if (byte == ' ') {
+            try transformed.appendSlice("▁");
+        } else {
+            try transformed.append(byte);
+        }
+    }
+
+    var view = try std.unicode.Utf8View.init(transformed.items);
+    var it = view.iterator();
+    while (it.nextCodepointSlice()) |slice| {
+        try symbols.append(try allocator.dupe(u8, slice));
+    }
+}
+
 fn appendByteLevelDecoded(out: *std.array_list.Managed(u8), token: []const u8) !void {
     var view = try std.unicode.Utf8View.init(token);
     var it = view.iterator();
     while (it.nextCodepoint()) |cp| {
         try out.append(try unicodeToByte(cp));
+    }
+}
+
+fn appendMetaspaceByteFallbackDecoded(out: *std.array_list.Managed(u8), token: []const u8) !void {
+    if (parseByteFallbackToken(token)) |byte| {
+        try out.append(byte);
+        return;
+    }
+
+    var view = try std.unicode.Utf8View.init(token);
+    var it = view.iterator();
+    while (it.nextCodepointSlice()) |slice| {
+        if (std.mem.eql(u8, slice, "▁")) {
+            try out.append(' ');
+        } else {
+            try out.appendSlice(slice);
+        }
     }
 }
 
@@ -429,6 +524,30 @@ fn writeByteLevelDecoded(writer: *std.Io.Writer, token: []const u8) !void {
         byte_buf[0] = try unicodeToByte(cp);
         try writer.writeAll(&byte_buf);
     }
+}
+
+fn writeMetaspaceByteFallbackDecoded(writer: *std.Io.Writer, token: []const u8) !void {
+    if (parseByteFallbackToken(token)) |byte| {
+        const bytes = [1]u8{byte};
+        try writer.writeAll(&bytes);
+        return;
+    }
+
+    var view = try std.unicode.Utf8View.init(token);
+    var it = view.iterator();
+    while (it.nextCodepointSlice()) |slice| {
+        if (std.mem.eql(u8, slice, "▁")) {
+            try writer.writeAll(" ");
+        } else {
+            try writer.writeAll(slice);
+        }
+    }
+}
+
+fn parseByteFallbackToken(token: []const u8) ?u8 {
+    if (token.len != 6) return null;
+    if (!std.mem.startsWith(u8, token, "<0x") or token[5] != '>') return null;
+    return std.fmt.parseInt(u8, token[3..5], 16) catch null;
 }
 
 fn byteToUnicode(byte: u8) u21 {
@@ -522,4 +641,42 @@ test "special token matching prefers complete marker boundaries" {
     const ids = try tok.encode(allocator, "<|x|>");
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(u32, &.{4}, ids);
+}
+
+test "metaspace byte-fallback bpe encodes mistral-style prompts" {
+    const allocator = std.testing.allocator;
+    var tok = try Tokenizer.fromJson(allocator,
+        \\{
+        \\  "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "first", "split": false},
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "byte_fallback": true,
+        \\    "vocab": {
+        \\      "<unk>": 0,
+        \\      "<s>": 1,
+        \\      "</s>": 2,
+        \\      "<0x21>": 3,
+        \\      "▁": 4,
+        \\      "h": 5,
+        \\      "i": 6,
+        \\      "▁hi": 7
+        \\    },
+        \\    "merges": [["▁", "h"], ["▁h", "i"]]
+        \\  },
+        \\  "added_tokens": [
+        \\    {"id": 0, "content": "<unk>", "special": true},
+        \\    {"id": 1, "content": "<s>", "special": true},
+        \\    {"id": 2, "content": "</s>", "special": true}
+        \\  ]
+        \\}
+    );
+    defer tok.deinit();
+
+    const ids = try tok.encode(allocator, "<s>hi!");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 7, 3 }, ids);
+
+    const text = try tok.decode(allocator, &.{ 7, 3 });
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings(" hi!", text);
 }

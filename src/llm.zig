@@ -28,12 +28,14 @@ pub const Error = tensor.Error || error{
 
 pub const Architecture = enum {
     llama,
+    mistral,
     olmoe,
     qwen2,
 
     pub fn ggufPrefix(self: Architecture) []const u8 {
         return switch (self) {
             .llama => "llama",
+            .mistral => "mistral",
             .olmoe => "olmoe",
             .qwen2 => "qwen2",
         };
@@ -43,6 +45,11 @@ pub const Architecture = enum {
 pub const FeedForwardKind = enum {
     dense,
     moe,
+};
+
+pub const RopeLayout = enum {
+    interleaved,
+    split_half,
 };
 
 pub const WeightKind = enum {
@@ -79,6 +86,7 @@ pub const Config = struct {
     num_experts: usize = 0,
     num_experts_per_token: usize = 0,
     qk_norm: bool = false,
+    rope_layout: RopeLayout = .split_half,
     max_position_embeddings: usize,
     rope_theta: f32,
     rms_norm_eps: f32,
@@ -98,6 +106,8 @@ pub const Config = struct {
         const model_type = getString(object, "model_type") orelse return Error.MissingJsonField;
         const architecture: Architecture = if (std.mem.eql(u8, model_type, "llama"))
             .llama
+        else if (std.mem.eql(u8, model_type, "mistral"))
+            .mistral
         else if (std.mem.eql(u8, model_type, "olmoe"))
             .olmoe
         else if (std.mem.eql(u8, model_type, "qwen2"))
@@ -108,6 +118,7 @@ pub const Config = struct {
         const heads = try getRequiredUsize(object, "num_attention_heads");
         const num_experts = getOptionalUsize(object, "num_experts") orelse 0;
         const feed_forward: FeedForwardKind = if (num_experts == 0) .dense else .moe;
+        const default_qkv_bias = architecture == .qwen2;
         var config = Config{
             .architecture = architecture,
             .feed_forward = feed_forward,
@@ -120,11 +131,12 @@ pub const Config = struct {
             .num_experts = num_experts,
             .num_experts_per_token = getOptionalUsize(object, "num_experts_per_tok") orelse 0,
             .qk_norm = architecture == .olmoe,
+            .rope_layout = .split_half,
             .max_position_embeddings = try getRequiredUsize(object, "max_position_embeddings"),
             .rope_theta = getOptionalF32(object, "rope_theta") orelse 10_000.0,
             .rms_norm_eps = getOptionalF32(object, "rms_norm_eps") orelse 0.000001,
             .tie_word_embeddings = getOptionalBool(object, "tie_word_embeddings") orelse false,
-            .qkv_bias = getOptionalBool(object, "attention_bias") orelse true,
+            .qkv_bias = getOptionalBool(object, "attention_bias") orelse default_qkv_bias,
             .eos_token_id = getOptionalTokenId(object, "eos_token_id") orelse 0,
             .pad_token_id = getOptionalTokenId(object, "pad_token_id") orelse 0,
         };
@@ -142,6 +154,8 @@ pub const Config = struct {
         const arch_text = file.string("general.architecture") orelse return Error.MissingJsonField;
         const architecture: Architecture = if (std.mem.eql(u8, arch_text, "llama"))
             .llama
+        else if (std.mem.eql(u8, arch_text, "mistral"))
+            .mistral
         else if (std.mem.eql(u8, arch_text, "qwen2"))
             .qwen2
         else if (std.mem.eql(u8, arch_text, "olmoe"))
@@ -165,6 +179,7 @@ pub const Config = struct {
             .num_hidden_layers = try requiredGgufUsize(file, prefix, "block_count"),
             .num_attention_heads = heads,
             .num_key_value_heads = optionalGgufUsize(file, prefix, "attention.head_count_kv") orelse heads,
+            .rope_layout = .interleaved,
             .max_position_embeddings = try requiredGgufUsize(file, prefix, "context_length"),
             .rope_theta = optionalGgufF32(file, prefix, "rope.freq_base") orelse 10_000.0,
             .rms_norm_eps = optionalGgufF32(file, prefix, "attention.layer_norm_rms_epsilon") orelse 0.000001,
@@ -202,7 +217,7 @@ pub const Config = struct {
 
     pub fn supportsDenseRunner(self: Config) bool {
         return self.feed_forward == .dense and switch (self.architecture) {
-            .llama, .qwen2 => true,
+            .llama, .mistral, .qwen2 => true,
             .olmoe => false,
         };
     }
@@ -724,8 +739,8 @@ pub const Runner = struct {
         try linearInto(self.scratch.k, layer.k_proj, self.scratch.norm, layer.k_bias, self.options);
         try linearInto(self.scratch.v, layer.v_proj, self.scratch.norm, layer.v_bias, self.options);
 
-        applyRoPE(self.scratch.q, config.num_attention_heads, config.headDim(), position, config.rope_theta);
-        applyRoPE(self.scratch.k, config.num_key_value_heads, config.headDim(), position, config.rope_theta);
+        applyRoPE(self.scratch.q, config.num_attention_heads, config.headDim(), position, config.rope_theta, config.rope_layout);
+        applyRoPE(self.scratch.k, config.num_key_value_heads, config.headDim(), position, config.rope_theta, config.rope_layout);
         @memcpy(self.cache.keySlice(layer_index, position), self.scratch.k);
         @memcpy(self.cache.valueSlice(layer_index, position), self.scratch.v);
 
@@ -1319,26 +1334,40 @@ fn computeAttentionInto(
     }
 }
 
-fn applyRoPE(values: []f32, heads: usize, head_dim: usize, position: usize, theta: f32) void {
+fn applyRoPE(values: []f32, heads: usize, head_dim: usize, position: usize, theta: f32, layout: RopeLayout) void {
     std.debug.assert(values.len == heads * head_dim);
 
     const pos_f = @as(f32, @floatFromInt(position));
     const dim_f = @as(f32, @floatFromInt(head_dim));
     for (0..heads) |head| {
         const head_slice = values[head * head_dim ..][0..head_dim];
-        var i: usize = 0;
-        while (i < head_dim) : (i += 2) {
-            const exponent = @as(f32, @floatFromInt(i)) / dim_f;
-            const inv_freq = 1.0 / std.math.pow(f32, theta, exponent);
-            const angle = pos_f * inv_freq;
-            const cos_v = std.math.cos(angle);
-            const sin_v = std.math.sin(angle);
-            const x0 = head_slice[i];
-            const x1 = head_slice[i + 1];
-            head_slice[i] = x0 * cos_v - x1 * sin_v;
-            head_slice[i + 1] = x0 * sin_v + x1 * cos_v;
+        switch (layout) {
+            .interleaved => {
+                var i: usize = 0;
+                while (i < head_dim) : (i += 2) {
+                    rotatePair(head_slice, i, i + 1, i, dim_f, pos_f, theta);
+                }
+            },
+            .split_half => {
+                const half = head_dim / 2;
+                for (0..half) |i| {
+                    rotatePair(head_slice, i, i + half, i * 2, dim_f, pos_f, theta);
+                }
+            },
         }
     }
+}
+
+fn rotatePair(values: []f32, first: usize, second: usize, dim_index: usize, dim_f: f32, pos_f: f32, theta: f32) void {
+    const exponent = @as(f32, @floatFromInt(dim_index)) / dim_f;
+    const inv_freq = 1.0 / std.math.pow(f32, theta, exponent);
+    const angle = pos_f * inv_freq;
+    const cos_v = std.math.cos(angle);
+    const sin_v = std.math.sin(angle);
+    const x0 = values[first];
+    const x1 = values[second];
+    values[first] = x0 * cos_v - x1 * sin_v;
+    values[second] = x0 * sin_v + x1 * cos_v;
 }
 
 fn copyEmbeddingToken(out: []f32, embedding: Matrix, token_id: u32) void {
@@ -1602,6 +1631,32 @@ test "dense llama config parses as a supported non-moe architecture" {
     try std.testing.expectEqual(@as(usize, 64), config.headDim());
 }
 
+test "dense mistral config defaults to split-half rope and no qkv bias" {
+    const config = try Config.fromJson(std.testing.allocator,
+        \\{
+        \\  "model_type": "mistral",
+        \\  "vocab_size": 32000,
+        \\  "hidden_size": 4096,
+        \\  "intermediate_size": 14336,
+        \\  "num_hidden_layers": 32,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 8,
+        \\  "max_position_embeddings": 32768,
+        \\  "rope_theta": 10000.0,
+        \\  "rms_norm_eps": 1e-5,
+        \\  "tie_word_embeddings": false,
+        \\  "eos_token_id": 2,
+        \\  "pad_token_id": 2
+        \\}
+    );
+
+    try config.validate();
+    try std.testing.expectEqual(Architecture.mistral, config.architecture);
+    try std.testing.expectEqual(RopeLayout.split_half, config.rope_layout);
+    try std.testing.expect(!config.qkv_bias);
+    try std.testing.expect(config.supportsDenseRunner());
+}
+
 test "olmoe config parses as moe but is not forced through dense runner" {
     const config = try Config.fromJson(std.testing.allocator,
         \\{
@@ -1643,6 +1698,21 @@ test "bf16 conversion and vector expansion" {
     try std.testing.expectApproxEqAbs(@as(f32, -2.5), out[1], 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), out[2], 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 8.0), out[3], 0.01);
+}
+
+test "rope layout distinguishes split-half safetensors from interleaved gguf order" {
+    var split = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    var interleaved = split;
+
+    applyRoPE(&split, 1, 4, 1, 10_000.0, .split_half);
+    applyRoPE(&interleaved, 1, 4, 1, 10_000.0, .interleaved);
+
+    const cos0 = std.math.cos(@as(f32, 1.0));
+    const sin0 = std.math.sin(@as(f32, 1.0));
+    try std.testing.expectApproxEqAbs(1.0 * cos0 - 3.0 * sin0, split[0], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0 * sin0 + 3.0 * cos0, split[2], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0 * cos0 - 2.0 * sin0, interleaved[0], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0 * sin0 + 2.0 * cos0, interleaved[1], 1e-6);
 }
 
 test "owned model lays weights out in one aligned contiguous blob" {

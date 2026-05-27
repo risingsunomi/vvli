@@ -4,7 +4,7 @@ VVLI stands for Vision, Voice, and Language Inference. It is a CPU-only Zig infe
 
 The current version is focused on CPU language-model inference first: dense and MoE model plumbing, Hugging Face safetensors, GGUF metadata/tensor parsing, contiguous host memory, SIMD-friendly tensor kernels, dynamic CPU threading, KV cache reuse, and generated-token throughput reporting.
 
-This project does not use CUDA, Metal, MPS, or any GPU backend.
+Model inference still runs on the CPU path. Metal and ROCm/LLVM smoke tests are now present for backend bring-up before GPU kernels are wired into LLM matmul.
 
 ## Status
 
@@ -125,13 +125,13 @@ VVLI auto-selects a native BF16/F16/F32 text GGUF and `mmproj-F16.gguf` when pre
 
 ## Environment Defaults
 
-`.env` supports `KEY=VALUE` lines, comments with `#`, optional `export`, and single- or double-quoted values. The recognized keys are:
+`.env` parsing is provided by `velikoss/dotenv-zig`. It supports `KEY=VALUE` lines, full-line comments with `#`, and single- or double-quoted values. Boolean values use `true`/`false` or `1`/`0`. Values from `.env` are checked before matching `VVLI_*` process environment variables. The recognized keys are:
 
 `VVLI_REPO`, `VVLI_REVISION`, `VVLI_CACHE`, `VVLI_FORMAT`, `VVLI_WEIGHTS`, `VVLI_MMPROJ`, `VVLI_PROMPT`, `VVLI_IMAGE`, `VVLI_MAX_NEW_TOKENS`, `VVLI_CTX`, `VVLI_THREADS`, `VVLI_DOWNLOAD`, `VVLI_CHAT_TEMPLATE`, `VVLI_STREAM`, `VVLI_TEMPERATURE`, `VVLI_TOP_P`, `VVLI_TOP_K`, `VVLI_REPEAT_PENALTY`, `VVLI_REPEAT_LAST_N`, `VVLI_SEED`, and `VVLI_GREEDY`.
 
 ## Model Targets
 
-- Dense safetensors: Qwen2 and Llama-style decoder layouts are the current runtime path.
+- Dense safetensors: Qwen2, Llama-style, and Mistral-style decoder layouts are the current runtime path.
 - GGUF: BF16/F16/F32 dense GGUF parsing and loading is the native-float boundary. Quantized GGUF files such as Q4/Q8 are rejected with `QuantizedGgufUnsupported`/`UnsupportedDType` until dequant kernels exist.
 - Vision-language GGUF: repos such as `unsloth/Qwen3.5-9B-GGUF` expose image-text model metadata and separate projector files. VVLI validates `--image`, downloads/selects the text GGUF plus `mmproj`, decodes/resizes images on macOS through ImageIO, runs native Qwen3VL patch embedding, position embedding, vision transformer attention with M-RoPE, runs the `mm.0`/`mm.2` projector MLP for Qwen-style merger projectors, and inserts multimodal image-pad slots into the prompt. The remaining Qwen3.5 generation boundary is the `qwen35` hybrid/SSM text runtime plus quantized GGUF matmul support.
 - MoE: OLMoE-style configs are detected via MoE fields (`num_experts`, `num_experts_per_tok`) and rejected with `MoeRuntimeUnsupported` until router/top-k expert execution is implemented.
@@ -144,6 +144,15 @@ zig build test
 zig build -Doptimize=ReleaseFast test
 ```
 
+GPU backend smoke tests:
+
+```sh
+zig build smoke-metal
+zig build smoke-rocm-llvm -Drocm-path=/opt/rocm -Drocm-arch=gfx1100
+```
+
+`smoke-metal` runs a real Metal compute vector-add kernel on macOS. `smoke-rocm-llvm` compiles the HIP smoke kernel through ROCm Clang/LLVM and emits `zig-out/rocm/vvli_rocm_smoke.ll`; `gfx1100` is the target for Radeon RX 7900 XT/XTX class cards.
+
 ## Project Layout
 
 - `src/tensor.zig`: contiguous aligned tensor storage and CPU math kernels
@@ -154,8 +163,10 @@ zig build -Doptimize=ReleaseFast test
 - `src/hf_downloader.zig`: Hugging Face snapshot downloader
 - `src/vision.zig`: local image path validation plus native macOS image decode/resize
 - `src/vlm.zig`: native VLM GGUF/mmproj plan loading, Qwen3VL patch embedding, vision transformer/M-RoPE, projector MLP, and image-token prompt insertion
+- `src/gpu`: Metal and ROCm backend smoke-test sources
 - `src/main.zig`: CLI prompt runner
 - `docs/tensor.md`: tensor API and implementation notes
+- `docs/gpu.md`: GPU backend smoke-test notes
 
 ## License
 
